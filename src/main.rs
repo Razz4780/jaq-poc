@@ -1,4 +1,4 @@
-use std::{io::Read, process::ExitCode};
+use std::{io::Read, ops::Not, process::ExitCode};
 
 use jaq_core::{
     Ctx, RcIter,
@@ -38,7 +38,11 @@ fn main() -> ExitCode {
     let input: Value = serde_json::from_slice(&json).expect("failed to parse input as JSON");
 
     let program = File { code, path: () };
-    let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+    let safe_defs = jaq_std::defs().filter(|definition| {
+        const DANGEROUS: &[&str] = &["range", "repeat", "recurse", "while", "until"];
+        DANGEROUS.contains(&definition.name).not()
+    });
+    let loader = Loader::new(safe_defs.chain(jaq_json::defs()));
     let arena = Arena::default();
 
     let modules = loader
