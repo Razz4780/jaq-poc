@@ -1,0 +1,10 @@
+[package]
+name = "jaq-playground"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jaq-core = "2.2"
+jaq-json = { version = "1.1", features = ["serde_json"] }
+serde_json = "1"
+jaq-std = "2.1"
