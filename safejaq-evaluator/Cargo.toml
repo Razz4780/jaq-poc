@@ -1,0 +1,19 @@
+[package]
+name = "safejaq-evaluator"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "safejaq_evaluator"
+path = "src/main.rs"
+
+[dependencies]
+jaq-core = "2.2"
+jaq-json = { version = "1.1", features = ["serde_json"] }
+jaq-std = "2.1"
+nix = { version = "0.31", features = ["resource"] }
+safejaq-types.path = "../safejaq-types"
+serde_json.workspace = true
+
+[dev-dependencies]
+rstest = "0.26"
