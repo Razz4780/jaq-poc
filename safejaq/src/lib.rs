@@ -68,7 +68,7 @@ impl SafeJaq {
             )
             .stdout(Stdio::piped())
             .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .map_err(SafeJaqError::Command)?;
@@ -170,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn test_evaluate() {
         let dir = tempfile::tempdir().unwrap();
-        let mut jaq = SafeJaq::new(dir.path(), Duration::from_millis(250), 64 * 1024).unwrap();
+        let jaq = SafeJaq::new(dir.path(), Duration::from_millis(250), 64 * 1024).unwrap();
         let value = std::iter::repeat('a')
             .take(64 * 1024 * 1024)
             .collect::<String>();
