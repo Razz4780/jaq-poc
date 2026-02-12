@@ -122,6 +122,7 @@ impl SafeJaq {
             ));
         };
 
+        // The child process has already finished, so `wait_with_output` here should finish instantly.
         let stdout = match child.wait_with_output().await {
             Ok(output) if output.status.success() => output.stdout,
             Ok(output) => {
