@@ -7,15 +7,15 @@ pub enum Error {
     #[error("jq filter is invalid: {0}")]
     InvalidFilter(String),
 
-    /// The worker could not parse the input as JSON.
-    #[error("input is not valid JSON: {0}")]
+    /// The input has no JSON representation, for example a map with keys that are not strings.
+    #[error("input cannot be represented as JSON: {0}")]
     InvalidInput(String),
 
     #[error("jq filter is {len} bytes long, the limit is {limit}")]
     FilterTooLarge { len: usize, limit: usize },
 
-    #[error("input is {len} bytes long, the limit is {limit}")]
-    InputTooLarge { len: usize, limit: usize },
+    #[error("input is longer than the limit of {limit} bytes")]
+    InputTooLarge { limit: usize },
 
     /// The evaluation ran into one of the configured limits and its worker was killed.
     #[error("jq evaluation exceeded its {0} limit")]
@@ -31,6 +31,26 @@ pub enum Error {
     /// threads.
     #[error("jq sandbox is unavailable: {0}")]
     Unavailable(#[source] io::Error),
+}
+
+impl Error {
+    /// The same error again, for each filter of a batch that it ended.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::InvalidFilter(message) => Self::InvalidFilter(message.clone()),
+            Self::InvalidInput(message) => Self::InvalidInput(message.clone()),
+            Self::FilterTooLarge { len, limit } => Self::FilterTooLarge {
+                len: *len,
+                limit: *limit,
+            },
+            Self::InputTooLarge { limit } => Self::InputTooLarge { limit: *limit },
+            Self::LimitExceeded(limit) => Self::LimitExceeded(*limit),
+            Self::WorkerDied(message) => Self::WorkerDied(message.clone()),
+            Self::Unavailable(error) => {
+                Self::Unavailable(io::Error::new(error.kind(), error.to_string()))
+            }
+        }
+    }
 }
 
 /// A per-evaluation limit from [`Config`](crate::Config).

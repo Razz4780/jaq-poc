@@ -27,6 +27,8 @@ use nix::{
 use crate::{
     Config, Sandbox,
     control::{self, Reply, Request},
+    jq,
+    shm::{self, ArenaView, Mapping},
     worker,
 };
 
@@ -44,6 +46,8 @@ pub struct Dispatcher {
     pub(crate) control: OwnedFd,
     pub(crate) reaper: Reaper,
     pub(crate) config: Config,
+    /// The service's writable view of the input arena.
+    pub(crate) arena: Mapping,
 }
 
 impl Dispatcher {
@@ -59,10 +63,10 @@ impl Dispatcher {
     /// process has not loaded yet is not in the copy. Descriptors the process has open by then,
     /// other than its standard streams, are closed in the dispatcher.
     pub fn fork(config: Config) -> io::Result<Self> {
-        if config.workers == 0 || config.cpu_time.is_zero() {
+        if config.workers == 0 || config.cpu_time.is_zero() || config.input_arena == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "`workers` and `cpu_time` must not be zero",
+                "`workers`, `cpu_time` and `input_arena` must not be zero",
             ));
         }
         if u32::try_from(config.max_filter_len).is_err()
@@ -79,6 +83,11 @@ impl Dispatcher {
             ));
         }
 
+        // Created here, before the fork, so that the dispatcher and through it every worker can
+        // map it. The service's mapping is the only writable one.
+        let arena_fd = shm::create(c"jq-inputs", config.input_arena)?;
+        let arena = Mapping::new(arena_fd.as_fd(), config.input_arena, true)?;
+
         let (service_end, dispatcher_end) = socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -92,14 +101,18 @@ impl Dispatcher {
         match unsafe { fork() }? {
             ForkResult::Child => {
                 drop(service_end);
-                run(dispatcher_end, service, config)
+                // The dispatcher maps the arena read-only instead.
+                drop(arena);
+                run(dispatcher_end, service, config, arena_fd)
             }
             ForkResult::Parent { child } => {
                 drop(dispatcher_end);
+                drop(arena_fd);
                 let dispatcher = Self {
                     control: service_end,
                     reaper: Reaper(child),
                     config,
+                    arena,
                 };
                 // The dispatcher reports whether it managed to set itself up, so that a broken
                 // sandbox fails the service's startup instead of its first evaluation.
@@ -164,6 +177,8 @@ struct Setup {
     /// `RLIMIT_DATA` for workers: the data the dispatcher itself holds, which every worker starts
     /// with a copy of, plus the configured budget.
     data_limit: u64,
+    /// The read-only view of the input arena that every worker inherits.
+    arena: ArenaView,
 }
 
 /// Closes every descriptor the dispatcher inherited from the service, except the standard streams
@@ -187,7 +202,7 @@ fn close_inherited(control: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn set_up(control: &OwnedFd, service: Pid, config: Config) -> io::Result<Setup> {
+fn set_up(control: &OwnedFd, service: Pid, config: Config, arena_fd: OwnedFd) -> io::Result<Setup> {
     // The signal is sent when the thread that forked this process exits. That is the service's
     // main thread, which lives as long as the service does.
     prctl::set_pdeathsig(Signal::SIGKILL)?;
@@ -196,6 +211,8 @@ fn set_up(control: &OwnedFd, service: Pid, config: Config) -> io::Result<Setup> 
         exit(0);
     }
 
+    let arena = ArenaView::new(Mapping::read_only(arena_fd.as_fd(), config.input_arena)?);
+    drop(arena_fd);
     close_inherited(control)?;
 
     // Neither the dispatcher nor its workers need any privilege the service may have. Workers
@@ -210,23 +227,27 @@ fn set_up(control: &OwnedFd, service: Pid, config: Config) -> io::Result<Setup> 
         caps::clear(None, set).map_err(io::Error::other)?;
     }
 
+    // Parsing jaq's library here, once, spares every worker doing it before its first filter.
+    jq::init();
+
     Ok(Setup {
         data_limit: data_size()? + config.memory,
         config,
+        arena,
     })
 }
 
 /// The dispatcher's whole life. It stays single-threaded, which is what keeps `fork` safe here.
-fn run(control: OwnedFd, service: Pid, config: Config) -> ! {
-    let setup = match set_up(&control, service, config) {
+fn run(control: OwnedFd, service: Pid, config: Config, arena_fd: OwnedFd) -> ! {
+    let setup = match set_up(&control, service, config, arena_fd) {
         Ok(setup) => setup,
         Err(error) => {
             let errno = error.raw_os_error().map_or(Errno::EIO, Errno::from_raw);
-            let _ = control::send(control.as_fd(), Reply::Failed(errno).encode(), None);
+            let _ = control::send(control.as_fd(), Reply::Failed(errno).encode(), &[]);
             exit(1);
         }
     };
-    if control::send(control.as_fd(), Reply::Ready.encode(), None).is_err() {
+    if control::send(control.as_fd(), Reply::Ready.encode(), &[]).is_err() {
         exit(0);
     }
 
@@ -238,18 +259,18 @@ fn run(control: OwnedFd, service: Pid, config: Config) -> ! {
     while let Ok((message, _)) = control::receive(control.as_fd()) {
         let sent = match Request::decode(message) {
             Some(Request::Spawn) => match spawn_worker(&control, &setup) {
-                Ok((pid, service_end)) => {
+                Ok((pid, service_end, progress)) => {
                     workers.push(pid);
                     control::send(
                         control.as_fd(),
                         Reply::Spawned(pid).encode(),
-                        Some(service_end.as_fd()),
+                        &[service_end.as_fd(), progress.as_fd()],
                     )
-                    // `service_end` is closed here. The dispatcher must not keep any end of a
-                    // worker's socket: later workers would inherit it, and neither side would
-                    // ever see the other one close.
+                    // Both are closed here. The dispatcher must not keep any end of a worker's
+                    // socket: later workers would inherit it, and neither side would ever see
+                    // the other one close.
                 }
-                Err(errno) => control::send(control.as_fd(), Reply::Failed(errno).encode(), None),
+                Err(errno) => control::send(control.as_fd(), Reply::Failed(errno).encode(), &[]),
             },
             Some(Request::Release(pid)) => {
                 let reply = match workers.iter().position(|worker| *worker == pid) {
@@ -259,7 +280,7 @@ fn run(control: OwnedFd, service: Pid, config: Config) -> ! {
                     }
                     None => Reply::UnknownWorker,
                 };
-                control::send(control.as_fd(), reply.encode(), None)
+                control::send(control.as_fd(), reply.encode(), &[])
             }
             None => break,
         };
@@ -274,7 +295,9 @@ fn run(control: OwnedFd, service: Pid, config: Config) -> ! {
     exit(0)
 }
 
-fn spawn_worker(control: &OwnedFd, setup: &Setup) -> Result<(Pid, OwnedFd), Errno> {
+fn spawn_worker(control: &OwnedFd, setup: &Setup) -> Result<(Pid, OwnedFd, OwnedFd), Errno> {
+    let progress = shm::create(c"jq-progress", shm::PAGE_LEN)
+        .map_err(|error| error.raw_os_error().map_or(Errno::EIO, Errno::from_raw))?;
     let (service_end, worker_end) = socketpair(
         AddressFamily::Unix,
         SockType::Stream,
@@ -289,15 +312,17 @@ fn spawn_worker(control: &OwnedFd, setup: &Setup) -> Result<(Pid, OwnedFd), Errn
             // `SOCK_CLOEXEC` does nothing here, as a worker never calls `exec`: what the worker
             // must not hold has to be closed by hand.
             drop(service_end);
-            worker::run(
-                worker_end,
+            worker::run(worker::Setup {
+                socket: worker_end,
+                progress,
                 control,
                 dispatcher,
-                &setup.config,
-                setup.data_limit,
-            )
+                config: &setup.config,
+                data_limit: setup.data_limit,
+                arena: &setup.arena,
+            })
         }
-        ForkResult::Parent { child } => Ok((child, service_end)),
+        ForkResult::Parent { child } => Ok((child, service_end, progress)),
     }
 }
 

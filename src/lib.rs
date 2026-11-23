@@ -13,17 +13,26 @@
 //!      |      "spawn" / "release(pid)"         |
 //!      |                                       | fork
 //!      |           worker socket               v
-//!      +--------------------------------   worker(s)      one evaluation at a time each
-//!           filter + input / verdict
+//!      +--------------------------------   worker(s)      one request at a time each
+//!      |     filter ids / "done"               ^
+//!      |                                       | read-only
+//!      +-------- input arena (shared memory) --+
 //! ```
 //!
 //! - The **dispatcher** ([`Dispatcher::fork`]) is forked before the service starts any thread. It
 //!   stays single-threaded and tiny, and does nothing but fork and reap workers.
 //! - A **worker** is a fork of the dispatcher. Its socket is created by the dispatcher and the
 //!   service's end is passed over the control socket (`SCM_RIGHTS`), so requests go from the
-//!   service to the worker directly.
-//! - The **service** side ([`Sandbox`]) keeps a pool of workers and hands each evaluation to an
-//!   idle one.
+//!   service to the worker directly. It keeps every filter it compiles until told to forget it.
+//! - The **service** side ([`Sandbox`]) keeps a pool of workers and hands each request to an idle
+//!   one.
+//! - Inputs are encoded once into an **arena** of memory that every worker can read, and read in
+//!   place: a filter pays only for the parts of the input it looks at.
+//!
+//! Filters are long-lived: [`Sandbox::compile`] returns a [`Filter`] to evaluate as often as
+//! needed. Inputs are encoded once with [`Sandbox::input`], straight from any
+//! [`serde::Serialize`] type, and can go to any number of filters, in one round trip with
+//! [`Sandbox::evaluate_many`].
 //!
 //! ```no_run
 //! use jq_sandbox::{Config, Dispatcher};
@@ -35,8 +44,13 @@
 //!     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 //!     runtime.block_on(async {
 //!         let sandbox = dispatcher.connect()?;
-//!         let message = serde_json::json!({"priority": "high"});
-//!         assert!(sandbox.evaluate(r#".priority == "high""#, &message).await?);
+//!         let high = sandbox.compile(r#".priority == "high""#).await?;
+//!         let acme = sandbox.compile(r#".tenant | startswith("ac")"#).await?;
+//!
+//!         let message = sandbox.input(&serde_json::json!({"priority": "high", "tenant": "acme"}))?;
+//!         assert!(sandbox.evaluate(&high, &message).await?);
+//!         let verdicts = sandbox.evaluate_many(&[&high, &acme], &message).await;
+//!         assert!(verdicts.into_iter().all(|verdict| matches!(verdict, Ok(true))));
 //!         Ok(())
 //!     })
 //! }
@@ -48,13 +62,16 @@ compile_error!("jq-sandbox relies on Linux process primitives and only builds fo
 mod config;
 mod control;
 mod dispatcher;
+mod doc;
 mod error;
 mod jq;
 mod sandbox;
+mod shm;
+mod value;
 mod wire;
 mod worker;
 
 pub use config::Config;
 pub use dispatcher::Dispatcher;
 pub use error::{Error, Limit};
-pub use sandbox::Sandbox;
+pub use sandbox::{Filter, Input, Sandbox};
