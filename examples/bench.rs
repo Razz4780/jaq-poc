@@ -10,12 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jq_sandbox::{Config, Dispatcher, Error, Filter, Sandbox};
+use jq_sandbox::{Config, Error, Filter, Sandbox};
 use serde_json::{Value, json};
 
 const WORKERS: usize = 4;
 
-/// Private memory of this process's dispatcher and of its workers, in kB, from `/proc`.
+/// Private memory of this process's trampoline and of its workers, in kB, from `/proc`.
 fn private_memory() -> (u64, Vec<u64>) {
     let private_dirty = |pid: u32| {
         fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
@@ -37,12 +37,11 @@ fn private_memory() -> (u64, Vec<u64>) {
             .collect::<Vec<u32>>()
     };
 
-    let dispatcher = children(std::process::id()).first().copied().unwrap_or(0);
-    let workers = children(dispatcher)
-        .into_iter()
-        .map(private_dirty)
-        .collect();
-    (private_dirty(dispatcher), workers)
+    // The trampoline is forked first; the workers are its siblings.
+    let mut children = children(std::process::id()).into_iter();
+    let trampoline = children.next().unwrap_or(0);
+    let workers = children.map(private_dirty).collect();
+    (private_dirty(trampoline), workers)
 }
 
 fn percentile(sorted: &[Duration], percent: usize) -> Duration {
@@ -116,14 +115,8 @@ async fn throughput(sandbox: &Sandbox, filters: &[Filter], input: &Value, count:
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `JQ_BENCH_SPIN_US=50` measures with `Config::spin`.
-    let spin = std::env::var("JQ_BENCH_SPIN_US")
-        .ok()
-        .and_then(|us| us.parse().ok())
-        .map_or(Duration::ZERO, Duration::from_micros);
-    let dispatcher = Dispatcher::fork(Config {
+    let sandbox = Sandbox::new(Config {
         workers: WORKERS,
-        spin,
         ..Config::default()
     })?;
     // Stands in for everything a real service allocates after startup. The workers never see it.
@@ -133,10 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let sandbox = dispatcher.connect()?;
         let input = message();
 
-        println!("## one filter, one small message ({} bytes encoded)", sandbox.input(&input)?.len());
+        println!("## one filter, one small message ({} bytes encoded)", sandbox.input(&input)?.json().len());
         for source in [
             r#".headers["x-user"] == "michal""#,
             r#".payload | fromjson | .priority == "high" and (.tenant | test("^ac"))"#,
@@ -217,29 +209,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("   10k objects, `.items | map(.price) | add > 0`: {:?}", started.elapsed() / 100);
 
-        // Each of these compiles on a worker that has never seen the filter.
+        let small = sandbox.input(&message())?;
         let started = Instant::now();
         for i in 0..2_000 {
             let filter = sandbox.compile(&format!(r#".headers["x-user"] == "user-{i}""#)).await?;
-            sandbox.evaluate(&filter, &encoded).await?;
+            sandbox.evaluate(&filter, &small).await?;
         }
         println!("\nnew filter, compiled and evaluated once: {:?}", started.elapsed() / 2_000);
 
-        let mut kept = Vec::new();
-        for i in 0..1_000 {
-            kept.push(sandbox.compile(&format!(r#".headers["x-user"] == "user-{i}" and (.partition | tostring | test("^[0-9]+$"))"#)).await?);
-        }
-        let small = sandbox.input(&message())?;
-        for _ in 0..WORKERS * 4 {
-            let refs: Vec<&Filter> = kept.iter().collect();
-            sandbox.evaluate_many(&refs, &small).await;
-        }
-        let (dispatcher, workers) = private_memory();
+        // Workers are not dumpable, so only root can read their memory statistics.
+        let (trampoline, workers) = private_memory();
         println!(
-            "private memory with 1000 filters cached: dispatcher {dispatcher} kB, workers {workers:?} kB, with {} MiB on the service's heap",
+            "private memory: trampoline {trampoline} kB, workers {workers:?} kB (0 when not run as root), with {} MiB on the service's heap",
             service_heap.len() >> 20
         );
-        drop(kept);
 
         // Empty the pool, so that every evaluation below runs on a worker forked for it.
         let bomb = sandbox.compile(r#""a" * 1000000000"#).await?;

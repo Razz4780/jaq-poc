@@ -1,10 +1,10 @@
 //! End-to-end tests of the sandbox against hostile filters, hostile input and process failures.
 //!
-//! This is a plain `main` (`harness = false`): the dispatcher has to be forked before the process
-//! has a second thread, and the standard test harness runs every test on a thread of its own.
+//! This is a plain `main` (`harness = false`): a sandbox has to be created before the process has
+//! a second thread, and the standard test harness runs every test on a thread of its own.
 //!
 //! The binary also re-runs itself with an argument to play a service that dies, or one that
-//! forks its dispatcher too late.
+//! creates its sandbox too late.
 
 use std::{
     fs,
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jq_sandbox::{Config, Dispatcher, Error, Filter, Limit, Sandbox};
+use jq_sandbox::{Config, Error, Filter, Limit, Sandbox};
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
@@ -89,10 +89,21 @@ fn children_of(parent: Pid) -> Vec<(Pid, char)> {
     children
 }
 
-/// The dispatcher, right after the process forked its first one.
-fn first_child() -> Pid {
+/// The one child of this process that is not in `known`: a trampoline, right after a sandbox was
+/// created.
+fn new_child(known: &[Pid]) -> Pid {
     let children = children_of(Pid::this());
-    children.first().expect("the dispatcher was just forked").0
+    let mut new = children.iter().filter(|(pid, _)| !known.contains(pid));
+    let (pid, _) = new.next().expect("a trampoline was just forked");
+    assert!(new.next().is_none(), "one new child: {children:?}");
+    *pid
+}
+
+/// Workers are children of this process, next to the trampolines.
+fn workers(trampolines: &[Pid]) -> Vec<(Pid, char)> {
+    let mut children = children_of(Pid::this());
+    children.retain(|(pid, _)| !trampolines.contains(pid));
+    children
 }
 
 /// Whether the process is gone, or dead and only waiting to be reaped.
@@ -182,12 +193,15 @@ async fn size_limits(sandbox: &Sandbox) {
         "{result:?}"
     );
 
+    let result = sandbox.input(&std::collections::HashMap::from([((1, 2), 3)]));
+    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+
     let mut deep = json!(1);
     for _ in 0..1000 {
         deep = json!([deep]);
     }
-    let result = sandbox.input(&deep);
-    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+    let verdict = sandbox.eval(".[0][0] | type == \"array\"", &deep).await;
+    assert!(matches!(verdict, Ok(true)), "{verdict:?}");
 }
 
 /// Several filters on one input, in one round trip, with a runaway one in the middle: the
@@ -288,51 +302,13 @@ async fn typed_inputs(sandbox: &Sandbox) {
     }
 }
 
-/// Filters dropped and compiled again, many more than any worker keeps.
-async fn filter_turnover(sandbox: &Sandbox) {
-    let input = sandbox.input(&message()).unwrap();
-    for round in 0..20 {
-        let filters = futures_join((0..100).map(|i| {
-            let sandbox = sandbox.clone();
-            async move {
-                let filter = sandbox
-                    .compile(&format!(r#".priority == "high" and {round} + {i} >= 0"#))
-                    .await
-                    .unwrap();
-                sandbox
-                    .evaluate(&filter, &sandbox.input(&message()).unwrap())
-                    .await
-                    .map(|v| (v, filter))
-            }
-        }))
-        .await;
-        let filters: Vec<Filter> = filters
-            .into_iter()
-            .map(|result| {
-                let (verdict, filter) = result.unwrap();
-                assert!(verdict);
-                filter
-            })
-            .collect();
-        let refs: Vec<&Filter> = filters.iter().collect();
-        assert!(
-            sandbox
-                .evaluate_many(&refs, &input)
-                .await
-                .iter()
-                .all(|result| matches!(result, Ok(true)))
-        );
-    }
-}
-
-/// A batch of more distinct filters than a worker keeps compiled at once, run twice: it is split
-/// into requests the worker can hold, and the cache turns over in between.
-async fn more_filters_than_a_worker_keeps(sandbox: &Sandbox) {
+/// A batch with more source than one request carries: it is split across requests.
+async fn batch_split_across_requests(sandbox: &Sandbox) {
     let input = sandbox.input(&message()).unwrap();
     let filters = futures_join((0..1500).map(|i| {
         let sandbox = sandbox.clone();
         async move {
-            let padding = "x".repeat(100);
+            let padding = "x".repeat(1000);
             sandbox
                 .compile(&format!(r#".priority == "high" and "{padding}" != "{i}""#))
                 .await
@@ -364,23 +340,11 @@ async fn futures_join<T: Send + 'static>(
     outputs
 }
 
-/// Handles from one sandbox used with another, and inputs that do not fit in the arena.
-async fn foreign_handles_and_full_arena(sandbox: &Sandbox, small: &Sandbox) {
+/// Filters and inputs from one sandbox used with another.
+async fn foreign_handles(sandbox: &Sandbox, other: &Sandbox) {
     let filter = sandbox.compile(BENIGN).await.unwrap();
     let input = sandbox.input(&message()).unwrap();
-    assert!(matches!(small.evaluate(&filter, &input).await, Ok(true)));
-
-    // The small sandbox's arena holds one of these at a time.
-    let big = json!({"priority": "high", "padding": "x".repeat(40 << 10)});
-    let inputs: Vec<_> = (0..4).map(|_| small.input(&big).unwrap()).collect();
-    for input in &inputs {
-        assert!(matches!(small.evaluate(&filter, input).await, Ok(true)));
-        assert!(matches!(sandbox.evaluate(&filter, input).await, Ok(true)));
-    }
-    let shared = inputs
-        .iter()
-        .filter(|input| format!("{input:?}").contains("shared: true"));
-    assert_eq!(shared.count(), 1, "{inputs:?}");
+    assert!(matches!(other.evaluate(&filter, &input).await, Ok(true)));
 }
 
 /// Filters that, evaluated in-process, would hang a thread forever, exhaust the process's memory,
@@ -499,13 +463,29 @@ async fn hostile_input(sandbox: &Sandbox) {
     let input = json!({ "payload": r#"{"priority": "high"}"# });
     let verdict = sandbox.eval(filter, &input).await;
     assert!(matches!(verdict, Ok(true)), "{verdict:?}");
+
+    // The same, as the input itself: parsing it kills the worker before any filter runs, so
+    // every filter of the batch gets the error.
+    let raw = serde_json::value::RawValue::from_string(payload).unwrap();
+    let input = sandbox.input(&raw).unwrap();
+    let benign = sandbox.compile(BENIGN).await.unwrap();
+    let always = sandbox.compile("true").await.unwrap();
+    let results = sandbox.evaluate_many(&[&benign, &always], &input).await;
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Err(Error::LimitExceeded(Limit::Stack)))),
+        "{results:?}"
+    );
+    assert_healthy(sandbox).await;
 }
 
 /// Hostile and ordinary evaluations side by side: the ordinary ones must all get their verdict,
 /// and the pool must never grow past its size.
-async fn concurrency(sandbox: &Sandbox, dispatcher: Pid) {
+async fn concurrency(sandbox: &Sandbox, trampolines: &[Pid]) {
     let evaluations = (0..200).map(|i| {
         let sandbox = sandbox.clone();
+        let trampolines = trampolines.to_vec();
         tokio::spawn(async move {
             if i % 20 == 0 {
                 let result = sandbox.eval(RUNAWAY, &message()).await;
@@ -519,7 +499,7 @@ async fn concurrency(sandbox: &Sandbox, dispatcher: Pid) {
                 let verdict = sandbox.eval(BENIGN, &input).await;
                 assert!(matches!(verdict, Ok(v) if v == expected), "{verdict:?}");
             }
-            let workers = children_of(dispatcher).len();
+            let workers = workers(&trampolines).len();
             assert!(workers <= WORKERS, "{workers} workers exist at once");
         })
     });
@@ -529,7 +509,7 @@ async fn concurrency(sandbox: &Sandbox, dispatcher: Pid) {
 }
 
 /// A caller that gives up must not cost the pool a worker or leave one in a broken state.
-async fn cancellation(sandbox: &Sandbox, dispatcher: Pid) {
+async fn cancellation(sandbox: &Sandbox, trampolines: &[Pid]) {
     let input = message();
     for _ in 0..WORKERS * 2 {
         let abandoned =
@@ -545,14 +525,14 @@ async fn cancellation(sandbox: &Sandbox, dispatcher: Pid) {
     for evaluation in evaluations.collect::<Vec<_>>() {
         evaluation.await.unwrap();
     }
-    let workers = children_of(dispatcher).len();
+    let workers = workers(trampolines).len();
     assert!(workers <= WORKERS, "{workers} workers exist at once");
 }
 
 /// A worker that does not answer and does not burn CPU either is caught by the wall clock.
-async fn wall_clock(sandbox: &Sandbox, dispatcher: Pid) {
+async fn wall_clock(sandbox: &Sandbox, trampolines: &[Pid]) {
     assert_healthy(sandbox).await;
-    let workers = children_of(dispatcher);
+    let workers = workers(trampolines);
     assert!(!workers.is_empty());
     for (pid, _) in &workers {
         kill(*pid, Signal::SIGSTOP).unwrap();
@@ -575,7 +555,7 @@ async fn wall_clock(sandbox: &Sandbox, dispatcher: Pid) {
 
 /// Workers killed from outside while idle, as the kernel's out-of-memory killer could do, are
 /// replaced without failing the evaluation that finds them dead.
-async fn idle_workers_killed(sandbox: &Sandbox, dispatcher: Pid) {
+async fn idle_workers_killed(sandbox: &Sandbox, trampolines: &[Pid]) {
     let evaluations = (0..WORKERS).map(|_| {
         let sandbox = sandbox.clone();
         tokio::spawn(async move { assert_healthy(&sandbox).await })
@@ -584,7 +564,7 @@ async fn idle_workers_killed(sandbox: &Sandbox, dispatcher: Pid) {
         evaluation.await.unwrap();
     }
 
-    let workers = children_of(dispatcher);
+    let workers = workers(trampolines);
     assert!(!workers.is_empty());
     for (pid, _) in &workers {
         kill(*pid, Signal::SIGKILL).unwrap();
@@ -645,35 +625,34 @@ fn rerun(role: &str) -> std::process::Output {
 }
 
 /// Role: a service that dies abruptly while one of its workers is deep in a runaway filter.
-/// Prints the pids of its dispatcher and workers first.
+/// Prints the pids of its trampoline and workers first.
 fn service_that_dies() -> ExitCode {
-    let dispatcher = Dispatcher::fork(Config {
+    let sandbox = Sandbox::new(Config {
         cpu_time: Duration::from_secs(60),
         wall_time: Duration::from_secs(60),
         ..config()
     })
     .unwrap();
-    let dispatcher_pid = first_child();
+    let trampoline = new_child(&[]);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let sandbox = dispatcher.connect().unwrap();
         assert_healthy(&sandbox).await;
         tokio::spawn(async move { sandbox.eval(RUNAWAY, &message()).await });
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
-    let workers = children_of(dispatcher_pid);
+    let workers = workers(&[trampoline]);
     assert!(workers.iter().any(|(_, state)| *state == 'R'));
-    print!("{dispatcher_pid}");
+    print!("{trampoline}");
     for (pid, _) in workers {
         print!(" {pid}");
     }
     println!();
-    // No destructors, no goodbye to the dispatcher.
+    // No destructors, no goodbye to the trampoline.
     std::process::abort()
 }
 
@@ -686,7 +665,7 @@ fn orphans_die_with_the_service() {
         .collect::<Vec<_>>();
     assert!(
         pids.len() >= 2,
-        "expected a dispatcher and a worker, got {pids:?}; stderr: {}",
+        "expected a trampoline and a worker, got {pids:?}; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -694,17 +673,17 @@ fn orphans_die_with_the_service() {
     while !pids.iter().all(|pid| is_dead(*pid)) {
         assert!(
             Instant::now() < deadline,
-            "dispatcher and workers must not outlive the service: {pids:?}"
+            "trampoline and workers must not outlive the service: {pids:?}"
         );
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-/// Role: a service that starts a thread before forking its dispatcher.
+/// Role: a service that starts a thread before creating its sandbox.
 fn service_that_forks_late() -> ExitCode {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let thread = thread::spawn(move || stop_rx.recv());
-    let result = Dispatcher::fork(config());
+    let result = Sandbox::new(config());
     drop(stop_tx);
     let _ = thread.join();
     match result {
@@ -743,66 +722,52 @@ fn main() -> ExitCode {
     // Safety: no other thread exists yet.
     unsafe { std::env::set_var(SECRET_VARIABLE, "s3cr3t") };
 
-    let dispatcher = Dispatcher::fork(config()).expect("failed to fork the dispatcher");
-    let dispatcher_pid = first_child();
-    // A second, independent sandbox whose wall clock never gets in the way.
-    let patient = Dispatcher::fork(Config {
+    let sandbox = Sandbox::new(config()).expect("failed to create the sandbox");
+    let first = new_child(&[]);
+    // A second, independent sandbox whose wall clock never gets in the way. Created while the
+    // process already holds the first one's control socket, which its trampoline must not keep
+    // open.
+    let patient = Sandbox::new(Config {
         cpu_time: Duration::from_millis(200),
         wall_time: Duration::from_secs(120),
         ..config()
     })
-    .expect("failed to fork the second dispatcher");
-    // A third one with an arena that holds a single large input.
-    let small = Dispatcher::fork(Config {
-        workers: 1,
-        input_arena: 64 << 10,
-        ..config()
-    })
-    .expect("failed to fork the third dispatcher");
+    .expect("failed to create the second sandbox");
+    let trampolines = [first, new_child(&[first])];
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let sandbox = dispatcher.connect().unwrap();
-        let patient = patient.connect().unwrap();
-        let small = small.connect().unwrap();
-
         run("verdicts", verdicts(&sandbox)).await;
         run("invalid_filters", invalid_filters(&sandbox)).await;
         run("size_limits", size_limits(&sandbox)).await;
         run("batches", batches(&sandbox)).await;
         run("typed_inputs", typed_inputs(&sandbox)).await;
-        run("filter_turnover", filter_turnover(&sandbox)).await;
         run(
-            "more_filters_than_a_worker_keeps",
-            more_filters_than_a_worker_keeps(&sandbox),
-        )
-        .await;
-        run(
-            "foreign_handles_and_full_arena",
-            foreign_handles_and_full_arena(&sandbox, &small),
+            "batch_split_across_requests",
+            batch_split_across_requests(&sandbox),
         )
         .await;
         run("hostile_filters", hostile_filters(&sandbox)).await;
         run("ambient_builtins", ambient_builtins(&sandbox)).await;
         run("hostile_input", hostile_input(&sandbox)).await;
-        run("concurrency", concurrency(&sandbox, dispatcher_pid)).await;
-        run("cancellation", cancellation(&sandbox, dispatcher_pid)).await;
-        run("wall_clock", wall_clock(&sandbox, dispatcher_pid)).await;
+        // Until `patient` is used, every worker is `sandbox`'s.
+        run("concurrency", concurrency(&sandbox, &trampolines)).await;
+        run("cancellation", cancellation(&sandbox, &trampolines)).await;
+        run("wall_clock", wall_clock(&sandbox, &trampolines)).await;
         run(
             "idle_workers_killed",
-            idle_workers_killed(&sandbox, dispatcher_pid),
+            idle_workers_killed(&sandbox, &trampolines),
         )
         .await;
+        run("foreign_handles", foreign_handles(&sandbox, &patient)).await;
         run("starved_host", starved_host(&patient)).await;
 
-        // In the order they were forked. The second dispatcher was forked while the service
-        // already held the first one's control socket, and must not be keeping it open.
+        // In the order they were created.
         drop(sandbox);
         drop(patient);
-        drop(small);
     });
 
     println!("test orphans_die_with_the_service ...");
@@ -810,7 +775,7 @@ fn main() -> ExitCode {
     println!("test forking_late_is_refused ...");
     forking_late_is_refused();
 
-    // Both sandboxes were dropped inside `block_on`, which stops and reaps everything.
+    // Both sandboxes were dropped inside `block_on`, which kills and reaps everything.
     let left = children_of(Pid::this());
     assert!(left.is_empty(), "processes left behind: {left:?}");
     println!("test shutdown_leaves_no_process ... ok");

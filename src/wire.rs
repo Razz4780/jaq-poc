@@ -1,294 +1,144 @@
 //! Messages between the service and a worker, over the worker's stream socket.
 //!
-//! One request, one reply, strictly in turn. All integers are little-endian.
+//! The service sends one request and reads its whole reply before sending the next. Lengths are
+//! little-endian `u32`s.
 //!
-//! ```text
-//! check:     0 | id (u64) | source length (u32) | source
-//! evaluate:  1 | input | forget count (u32) | filter count (u32) | sources length (u32)
-//!              | forget count * id (u64)
-//!              | filter count * (id (u64) | source length (u32))
-//!              | sources | inline input
-//! input:     0 | arena offset (u64) | length (u32)       the input is in the arena
-//!            1 | 0 (u64)            | length (u32)       the input follows the request
-//!
-//! reply:     status (1 byte) | message length (u32) | message
-//! ```
-//!
-//! A check compiles a filter, and caches it under its id unless the id is 0. An evaluation first
-//! drops the cached filters listed to forget, then runs every filter on the input. A filter
-//! comes with its source the first time it is sent to a worker, and as its id alone after that.
-//! Verdicts go to the worker's progress page, not into the reply.
-//!
-//! The worker reads with blocking `std` I/O and the service with tokio, so each side has its own
-//! half of the codec here.
+//! - `CHECK`, then the length and text of a filter's source. The reply is [`VALID`], or
+//!   [`INVALID`] followed by the length and text of the compiler's message.
+//! - `EVALUATE`, then the length and JSON text of the input, the number of filters, and the
+//!   length and text of each filter's source. The reply is [`INPUT_OK`] or [`INPUT_INVALID`]
+//!   once the input is parsed, and after `INPUT_OK` one [`verdict`] per filter, each written as
+//!   soon as the filter is done. A worker that dies over a filter leaves every verdict before it
+//!   readable on the socket.
 
 use std::io::{self, Read};
 
-use crate::{Config, shm::MAX_BATCH};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Longest message a worker sends back. Compiler errors quote the filter, which can be large.
-pub const MAX_MESSAGE_LEN: usize = 4 << 10;
-/// Most filters one evaluation may tell a worker to forget.
-pub const MAX_FORGET: usize = 1 << 16;
+use crate::Config;
 
-const CHECK: u8 = 0;
-const EVALUATE: u8 = 1;
-const INPUT_ARENA: u8 = 0;
-const INPUT_INLINE: u8 = 1;
+const CHECK: u8 = 1;
+const EVALUATE: u8 = 2;
 
-/// Where the input of an evaluation is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputAt {
-    Arena { offset: usize, len: usize },
-    Inline { len: usize },
+pub const VALID: u8 = 1;
+pub const INVALID: u8 = 2;
+pub const INPUT_OK: u8 = 3;
+pub const INPUT_INVALID: u8 = 4;
+
+/// One byte per filter of an `EVALUATE` request.
+pub mod verdict {
+    pub const FALSE: u8 = 0;
+    pub const TRUE: u8 = 1;
+    pub const INVALID_FILTER: u8 = 2;
 }
 
-/// A filter as sent in an evaluation.
-pub struct FilterRef<'a> {
-    pub id: u64,
-    /// `None` if the worker has it cached.
-    pub source: Option<&'a str>,
-}
+/// Longest compiler message a worker sends.
+pub const MAX_MESSAGE_LEN: usize = 4096;
 
-pub fn encode_check(buffer: &mut Vec<u8>, id: u64, source: &str) {
-    buffer.clear();
-    buffer.push(CHECK);
-    buffer.extend_from_slice(&id.to_le_bytes());
-    // The service checks the length against `Config`, whose limits fit in a `u32`.
-    buffer.extend_from_slice(&(source.len() as u32).to_le_bytes());
-    buffer.extend_from_slice(source.as_bytes());
+/// Most filters in one `EVALUATE` request.
+pub const MAX_FILTERS: usize = 1 << 16;
+
+pub fn encode_check(source: &str) -> Vec<u8> {
+    let mut request = vec![CHECK];
+    put(&mut request, source.as_bytes());
+    request
 }
 
 pub fn encode_evaluate<'a>(
-    buffer: &mut Vec<u8>,
-    input: InputAt,
-    inline: &[u8],
-    forget: &[u64],
-    filters: impl ExactSizeIterator<Item = FilterRef<'a>> + Clone,
-) {
-    buffer.clear();
-    buffer.push(EVALUATE);
-    let (kind, offset, len) = match input {
-        InputAt::Arena { offset, len } => (INPUT_ARENA, offset, len),
-        InputAt::Inline { len } => (INPUT_INLINE, 0, len),
-    };
-    buffer.push(kind);
-    buffer.extend_from_slice(&(offset as u64).to_le_bytes());
-    buffer.extend_from_slice(&(len as u32).to_le_bytes());
-
-    let sources_len: usize = filters
-        .clone()
-        .filter_map(|filter| filter.source)
-        .map(str::len)
-        .sum();
-    buffer.extend_from_slice(&(forget.len() as u32).to_le_bytes());
-    buffer.extend_from_slice(&(filters.len() as u32).to_le_bytes());
-    buffer.extend_from_slice(&(sources_len as u32).to_le_bytes());
-    for id in forget {
-        buffer.extend_from_slice(&id.to_le_bytes());
+    input: &[u8],
+    filters: impl ExactSizeIterator<Item = &'a str>,
+) -> Vec<u8> {
+    let mut request = vec![EVALUATE];
+    put(&mut request, input);
+    request.extend_from_slice(&len(filters.len()).to_le_bytes());
+    for source in filters {
+        put(&mut request, source.as_bytes());
     }
-    for filter in filters.clone() {
-        buffer.extend_from_slice(&filter.id.to_le_bytes());
-        let len = filter.source.map_or(0, str::len);
-        buffer.extend_from_slice(&(len as u32).to_le_bytes());
-    }
-    for source in filters.filter_map(|filter| filter.source) {
-        buffer.extend_from_slice(source.as_bytes());
-    }
-    if let InputAt::Inline { .. } = input {
-        buffer.extend_from_slice(inline);
-    }
+    request
 }
 
-/// A decoded request. Borrows the worker's buffers, which are reused from one request to the
-/// next.
-pub enum Request<'a> {
-    Check {
-        id: u64,
-        source: &'a str,
-    },
+pub fn encode_invalid(message: &str) -> Vec<u8> {
+    let mut end = message.len().min(MAX_MESSAGE_LEN);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut reply = vec![INVALID];
+    put(
+        &mut reply,
+        message.as_bytes().get(..end).unwrap_or_default(),
+    );
+    reply
+}
+
+fn put(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    buffer.extend_from_slice(&len(bytes.len()).to_le_bytes());
+    buffer.extend_from_slice(bytes);
+}
+
+/// Lengths are bounded well below `u32::MAX` by [`Config`], which checks that its limits fit.
+fn len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+pub enum Request {
+    Check(String),
     Evaluate {
-        input: InputAt,
-        /// The inline input, empty if it is in the arena.
-        inline: &'a mut Vec<u8>,
-        forget: &'a [u64],
-        /// `(id, source)`, with an empty source for cached filters.
-        filters: Vec<(u64, &'a str)>,
+        input: Vec<u8>,
+        filters: Vec<String>,
     },
 }
 
-/// Buffers a worker reads requests into.
-#[derive(Default)]
-pub struct RequestBuffers {
-    sources: Vec<u8>,
-    forget: Vec<u64>,
-    lens: Vec<(u64, usize)>,
-    inline: Vec<u8>,
+/// Reads the next request, or `None` when the service has closed the socket.
+pub fn read_request(reader: &mut impl Read, config: &Config) -> io::Result<Option<Request>> {
+    let mut tag = [0];
+    if reader.read(&mut tag)? == 0 {
+        return Ok(None);
+    }
+    match tag {
+        [CHECK] => Ok(Some(Request::Check(read_source(reader, config)?))),
+        [EVALUATE] => {
+            let input = read_bytes(reader, config.max_input_len)?;
+            let count = read_len(reader, MAX_FILTERS)?;
+            let filters = (0..count)
+                .map(|_| read_source(reader, config))
+                .collect::<io::Result<_>>()?;
+            Ok(Some(Request::Evaluate { input, filters }))
+        }
+        _ => Err(io::ErrorKind::InvalidData.into()),
+    }
 }
 
-fn read_u32(reader: &mut impl Read) -> io::Result<usize> {
-    let mut bytes = [0; 4];
+fn read_source(reader: &mut impl Read, config: &Config) -> io::Result<String> {
+    String::from_utf8(read_bytes(reader, config.max_filter_len)?)
+        .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+fn read_len(reader: &mut impl Read, limit: usize) -> io::Result<usize> {
+    let mut len = [0; 4];
+    reader.read_exact(&mut len)?;
+    match usize::try_from(u32::from_le_bytes(len)) {
+        Ok(len) if len <= limit => Ok(len),
+        _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
+fn read_bytes(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let len = read_len(reader, limit)?;
+    let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes) as usize)
+    Ok(bytes)
 }
 
-fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn invalid() -> io::Error {
-    io::ErrorKind::InvalidData.into()
-}
-
-fn read_into(reader: &mut impl Read, buffer: &mut Vec<u8>, len: usize) -> io::Result<()> {
-    buffer.clear();
-    buffer.resize(len, 0);
-    reader.read_exact(buffer)
-}
-
-impl RequestBuffers {
-    /// Reads the next request. Fails when the service has closed the socket, and on a request
-    /// the service would never send.
-    pub fn read<'a>(
-        &'a mut self,
-        reader: &mut impl Read,
-        config: &Config,
-    ) -> io::Result<Request<'a>> {
-        let mut kind = [0];
-        reader.read_exact(&mut kind)?;
-        match kind {
-            [CHECK] => {
-                let id = read_u64(reader)?;
-                let len = read_u32(reader)?;
-                if len > config.max_filter_len {
-                    return Err(invalid());
-                }
-                read_into(reader, &mut self.sources, len)?;
-                let source = std::str::from_utf8(&self.sources).map_err(|_| invalid())?;
-                Ok(Request::Check { id, source })
-            }
-            [EVALUATE] => self.read_evaluate(reader, config),
-            _ => Err(invalid()),
+/// Reads the compiler's message that follows [`INVALID`].
+pub async fn read_message(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<String> {
+    let len = reader.read_u32_le().await?;
+    match usize::try_from(len) {
+        Ok(len) if len <= MAX_MESSAGE_LEN => {
+            let mut message = vec![0; len];
+            reader.read_exact(&mut message).await?;
+            Ok(String::from_utf8_lossy(&message).into_owned())
         }
-    }
-
-    fn read_evaluate<'a>(
-        &'a mut self,
-        reader: &mut impl Read,
-        config: &Config,
-    ) -> io::Result<Request<'a>> {
-        let mut kind = [0];
-        reader.read_exact(&mut kind)?;
-        let offset = read_u64(reader)?;
-        let len = read_u32(reader)?;
-        let input = match kind {
-            [INPUT_ARENA] => InputAt::Arena {
-                offset: usize::try_from(offset).map_err(|_| invalid())?,
-                len,
-            },
-            [INPUT_INLINE] if len <= config.max_input_len => InputAt::Inline { len },
-            _ => return Err(invalid()),
-        };
-
-        let forget_count = read_u32(reader)?;
-        let filter_count = read_u32(reader)?;
-        let sources_len = read_u32(reader)?;
-        if forget_count > MAX_FORGET
-            || filter_count > MAX_BATCH
-            || sources_len > filter_count.saturating_mul(config.max_filter_len)
-        {
-            return Err(invalid());
-        }
-
-        self.forget.clear();
-        for _ in 0..forget_count {
-            self.forget.push(read_u64(reader)?);
-        }
-        self.lens.clear();
-        for _ in 0..filter_count {
-            let id = read_u64(reader)?;
-            let len = read_u32(reader)?;
-            self.lens.push((id, len));
-        }
-        read_into(reader, &mut self.sources, sources_len)?;
-        let mut sources = std::str::from_utf8(&self.sources).map_err(|_| invalid())?;
-        let mut filters = Vec::with_capacity(filter_count);
-        for &(id, len) in &self.lens {
-            let source = sources.get(..len).ok_or_else(invalid)?;
-            sources = sources.get(len..).ok_or_else(invalid)?;
-            filters.push((id, source));
-        }
-        if !sources.is_empty() {
-            return Err(invalid());
-        }
-
-        match input {
-            InputAt::Inline { len } => read_into(reader, &mut self.inline, len)?,
-            InputAt::Arena { .. } => self.inline.clear(),
-        }
-        Ok(Request::Evaluate {
-            input,
-            inline: &mut self.inline,
-            forget: &self.forget,
-            filters,
-        })
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Reply {
-    /// Answer to an evaluation: the verdicts are in the progress page.
-    Evaluated,
-    /// Answer to a check.
-    Valid,
-    InvalidFilter(String),
-}
-
-const EVALUATED: u8 = 0;
-const VALID: u8 = 1;
-const INVALID_FILTER: u8 = 2;
-const HEADER_LEN: usize = 5;
-
-impl Reply {
-    pub fn encode(&self) -> Vec<u8> {
-        let (status, message) = match self {
-            Self::Evaluated => (EVALUATED, ""),
-            Self::Valid => (VALID, ""),
-            Self::InvalidFilter(message) => (INVALID_FILTER, message.as_str()),
-        };
-        let end = message.floor_char_boundary(MAX_MESSAGE_LEN);
-        let message = message.get(..end).unwrap_or_default().as_bytes();
-
-        let mut reply = Vec::with_capacity(HEADER_LEN + message.len());
-        reply.push(status);
-        reply.extend_from_slice(&(message.len() as u32).to_le_bytes());
-        reply.extend_from_slice(message);
-        reply
-    }
-
-    /// Takes one whole reply off the front of `buffer`, if it holds one. Fails on a reply a
-    /// worker would never send.
-    pub fn take(buffer: &mut Vec<u8>) -> io::Result<Option<Self>> {
-        let Some(&[status, l0, l1, l2, l3]) = buffer.get(..HEADER_LEN) else {
-            return Ok(None);
-        };
-        let len = u32::from_le_bytes([l0, l1, l2, l3]) as usize;
-        if len > MAX_MESSAGE_LEN {
-            return Err(invalid());
-        }
-        let Some(message) = buffer.get(HEADER_LEN..HEADER_LEN + len) else {
-            return Ok(None);
-        };
-        let reply = match status {
-            EVALUATED => Self::Evaluated,
-            VALID => Self::Valid,
-            INVALID_FILTER => Self::InvalidFilter(String::from_utf8_lossy(message).into_owned()),
-            _ => return Err(invalid()),
-        };
-        buffer.drain(..HEADER_LEN + len);
-        Ok(Some(reply))
+        _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
 
@@ -297,67 +147,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evaluate_roundtrip() {
-        let mut buffer = Vec::new();
-        let filters = [
-            FilterRef {
-                id: 7,
-                source: Some(".a"),
-            },
-            FilterRef {
-                id: 8,
-                source: None,
-            },
-            FilterRef {
-                id: 9,
-                source: Some(".b == 1"),
-            },
-        ];
-        encode_evaluate(
-            &mut buffer,
-            InputAt::Inline { len: 3 },
-            b"xyz",
-            &[1, 2],
-            filters.iter().map(|f| FilterRef {
-                id: f.id,
-                source: f.source,
-            }),
-        );
-        let mut buffers = RequestBuffers::default();
-        let request = buffers
-            .read(&mut buffer.as_slice(), &Config::default())
-            .unwrap();
-        let Request::Evaluate {
-            input,
-            inline,
-            forget,
-            filters,
-        } = request
+    fn requests_round_trip() {
+        let config = Config::default();
+
+        let encoded = encode_check(".a == 1");
+        let Some(Request::Check(source)) = read_request(&mut encoded.as_slice(), &config).unwrap()
         else {
-            panic!()
+            panic!("not a check");
         };
-        assert_eq!(input, InputAt::Inline { len: 3 });
-        assert_eq!(inline.as_slice(), b"xyz");
-        assert_eq!(forget, &[1, 2]);
-        assert_eq!(filters, vec![(7, ".a"), (8, ""), (9, ".b == 1")]);
+        assert_eq!(source, ".a == 1");
+
+        let encoded = encode_evaluate(br#"{"a":1}"#, [".a", "true"].into_iter());
+        let Some(Request::Evaluate { input, filters }) =
+            read_request(&mut encoded.as_slice(), &config).unwrap()
+        else {
+            panic!("not an evaluation");
+        };
+        assert_eq!(input, br#"{"a":1}"#);
+        assert_eq!(filters, [".a", "true"]);
+
+        assert!(read_request(&mut io::empty(), &config).unwrap().is_none());
+        assert!(read_request(&mut [9u8].as_slice(), &config).is_err());
+        // Truncated.
+        assert!(read_request(&mut encoded.get(..6).unwrap(), &config).is_err());
     }
 
     #[test]
-    fn reply_in_pieces() {
-        let encoded = Reply::InvalidFilter("nope".to_owned()).encode();
-        let (last, first) = encoded.split_last().unwrap();
-        let mut buffer = Vec::new();
-        for byte in first {
-            buffer.push(*byte);
-            assert_eq!(Reply::take(&mut buffer).unwrap(), None);
-        }
-        buffer.push(*last);
-        buffer.extend_from_slice(&Reply::Evaluated.encode());
-        assert_eq!(
-            Reply::take(&mut buffer).unwrap(),
-            Some(Reply::InvalidFilter("nope".to_owned()))
-        );
-        assert_eq!(Reply::take(&mut buffer).unwrap(), Some(Reply::Evaluated));
-        assert!(buffer.is_empty());
+    fn lengths_are_bounded() {
+        let config = Config {
+            max_filter_len: 4,
+            ..Config::default()
+        };
+        let encoded = encode_check("12345");
+        assert!(read_request(&mut encoded.as_slice(), &config).is_err());
+    }
+
+    #[test]
+    fn long_messages_are_cut_on_a_char_boundary() {
+        let message = "ż".repeat(MAX_MESSAGE_LEN);
+        let reply = encode_invalid(&message);
+        assert!(reply.len() <= 5 + MAX_MESSAGE_LEN);
+        assert!(std::str::from_utf8(reply.get(5..).unwrap()).is_ok());
     }
 }

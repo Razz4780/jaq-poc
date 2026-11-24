@@ -26,8 +26,8 @@ pub enum Error {
     #[error("jq worker died unexpectedly: {0}")]
     WorkerDied(String),
 
-    /// The dispatcher process cannot be reached, or it could not create a worker. Without the
-    /// dispatcher nothing can be evaluated, and it cannot be started again once the service runs
+    /// No worker could be forked, for example because the trampoline process is gone. Without
+    /// it nothing can be evaluated, and it cannot be started again once the service runs
     /// threads.
     #[error("jq sandbox is unavailable: {0}")]
     Unavailable(#[source] io::Error),

@@ -35,7 +35,10 @@ use jaq_core::{
     path::Part,
 };
 
-use crate::value::{self, Data, Value};
+use jaq_core::data::JustLut;
+use jaq_json::Val;
+
+type Data = JustLut<Val>;
 
 pub type Filter = jaq_core::Filter<Data>;
 
@@ -61,7 +64,7 @@ static PRELUDE: OnceLock<Prelude> = OnceLock::new();
 /// so that their error is the one the whole library gives.)
 pub static FULL_COMPILES: AtomicUsize = AtomicUsize::new(0);
 
-/// Parses jaq's library. Called in the dispatcher before it forks any worker, so that every
+/// Parses jaq's library. Called in the trampoline before it forks any worker, so that every
 /// worker starts with it.
 pub fn init() {
     prelude();
@@ -257,7 +260,7 @@ fn compile_with(
 
     let funs = jaq_core::funs()
         .chain(jaq_std::funs())
-        .chain(value::json_funs())
+        .chain(jaq_json::funs())
         .filter(|(name, _, _)| keep_native(name));
 
     Compiler::default()
@@ -278,29 +281,27 @@ fn compile_with(
 /// Outputs that are not booleans, and errors the filter raises, are skipped. A filter that
 /// produces no boolean at all does not match. `halt` raises an exception in jaq 3, which is
 /// skipped like an error.
-pub fn matches(filter: &Filter, input: Value) -> bool {
+pub fn matches(filter: &Filter, input: Val) -> bool {
     let ctx = Ctx::<Data>::new(&filter.lut, Vars::new([]));
     filter
         .id
         .run((ctx, input))
-        .find_map(|output| output.ok().and_then(|value| value.as_boolean()))
+        .find_map(|output| match output {
+            Ok(Val::Bool(value)) => Some(value),
+            _ => None,
+        })
         .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
-    use jaq_core::data::JustLut;
-    use jaq_json::Val;
     use serde_json::json;
 
     use super::*;
-    use crate::{doc, value::DocRef};
 
-    type ValFilter = jaq_core::Filter<JustLut<Val>>;
+    type ValFilter = Filter;
 
-    /// The reference: jaq as its documentation uses it, on values parsed from JSON text.
+    /// The reference: jaq compiled with its whole library, as its documentation does it.
     fn compile_reference(code: &str) -> Result<ValFilter, ()> {
         let defs = jaq_core::defs()
             .chain(jaq_std::defs())
@@ -335,23 +336,6 @@ mod tests {
             .collect()
     }
 
-    fn outputs(filter: &Filter, input: &serde_json::Value) -> Vec<String> {
-        let mut buffer = Vec::new();
-        doc::encode(input, usize::MAX, &mut buffer).unwrap();
-        let doc: value::Document = Rc::new(buffer);
-        let ctx = Ctx::<Data>::new(&filter.lut, Vars::new([]));
-        filter
-            .id
-            .run((ctx, Value::Doc(DocRef::root(doc))))
-            .take(50)
-            .map(|output| match output.map_err(|e| e.get_err()) {
-                Ok(value) => format!("{value}"),
-                Err(Ok(error)) => format!("error: {}", error.into_val()),
-                Err(Err(_)) => "halt".to_owned(),
-            })
-            .collect()
-    }
-
     fn inputs() -> Vec<serde_json::Value> {
         vec![
             json!({
@@ -373,7 +357,7 @@ mod tests {
         ]
     }
 
-    /// Filters that exercise every operation of `Value`, its fast paths and its fallbacks.
+    /// Filters that exercise a broad part of jaq's library.
     const FILTERS: &[&str] = &[
         ".",
         ".topic",
@@ -520,7 +504,7 @@ mod tests {
     ];
 
     #[test]
-    fn same_outputs_as_jaq_on_json() {
+    fn same_outputs_as_with_the_whole_library() {
         let before = FULL_COMPILES.load(Ordering::Relaxed);
         let mut failures = Vec::new();
         for code in FILTERS {
@@ -531,7 +515,7 @@ mod tests {
             let filter = compile(code).unwrap_or_else(|e| panic!("`{code}`: {e}"));
             for input in inputs() {
                 let expected = reference_outputs(&reference, &input);
-                let actual = outputs(&filter, &input);
+                let actual = reference_outputs(&filter, &input);
                 if expected != actual {
                     failures.push(format!(
                         "`{code}` on {input}\n  jaq:  {expected:?}\n  here: {actual:?}"
@@ -574,9 +558,6 @@ mod tests {
     #[test]
     fn halt_does_not_exit() {
         let filter = compile("halt, true").unwrap();
-        let mut buffer = Vec::new();
-        doc::encode(&json!(null), usize::MAX, &mut buffer).unwrap();
-        let input = Value::Doc(DocRef::root(Rc::new(buffer)));
-        assert!(matches(&filter, input));
+        assert!(matches(&filter, Val::Null));
     }
 }

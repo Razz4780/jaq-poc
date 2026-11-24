@@ -1,589 +1,175 @@
-//! The service's side: a pool of workers, the filters compiled on them, and the evaluations
-//! handed to them.
-//!
-//! # Filters
-//!
-//! A [`Filter`] is compiled once, by [`Sandbox::compile`], and then lives for as long as the
-//! service keeps the handle. Each worker compiles it the first time it runs it and keeps it until
-//! told otherwise, so the source crosses to a worker once, and later evaluations only name it by
-//! id. The service keeps a mirror of every worker's cache, so it always knows which filters to
-//! send in full. When the last handle to a filter is dropped, each worker that has it is told to
-//! forget it with its next request.
-//!
-//! A worker's cache is bounded by an estimate of its size, at a quarter of the worker's memory
-//! limit: past that, the filters it ran least recently are forgotten. A filter compiles in
-//! microseconds, so that costs little.
-//!
-//! # Inputs
-//!
-//! An [`Input`] is encoded once, by [`Sandbox::input`], into memory every worker can read, and any
-//! number of evaluations on any workers can then use it without copying it.
-//!
-//! # Batches
-//!
-//! [`Sandbox::evaluate_many`] runs several filters on one input in a single round trip to one
-//! worker, and the worker reads the input once for all of them. Each filter still gets its own
-//! CPU-time budget. If one of them kills the worker, the verdicts reached before it stand, it
-//! gets the error, and the filters after it go on on another worker.
+//! The service's side: a pool of workers, and the evaluations handed to them.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
-    fmt, io,
-    os::{
-        fd::{AsFd, OwnedFd},
-        unix::net::UnixStream as StdUnixStream,
-    },
-    sync::{
-        Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    fmt, fs, io,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use nix::{
-    fcntl::{FcntlArg, OFlag, fcntl},
-    sys::signal::Signal,
-    unistd::Pid,
-};
+use caps::CapSet;
+use nix::sys::{prctl, signal::Signal, wait::WaitStatus};
 use serde::Serialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest, unix::AsyncFd},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     runtime::Handle,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 
 use crate::{
-    Config, Dispatcher, Error, Limit,
-    control::{self, Reply as ControlReply, Request as ControlRequest},
-    dispatcher::Reaper,
-    doc::{self, EncodeError},
-    shm::{Arena, MAX_BATCH, Mapping, PAGE_LEN, Progress, Slot, verdict},
-    wire::{self, FilterRef, InputAt, Reply},
-    worker::{CPU_TIME_SIGNAL, MEMORY_SIGNAL, STACK_SIGNAL},
+    Config, Error, Limit, jq,
+    spawner::{Child, Trampoline},
+    wire::{self, verdict},
+    worker::{self, CPU_TIME_SIGNAL, MEMORY_SIGNAL, STACK_SIGNAL},
 };
+
+/// Most bytes of filter source sent to a worker in one request. A larger batch is split.
+const MAX_REQUEST_SOURCES: usize = 1 << 20;
 
 /// Evaluates jq filters in sandboxed worker processes.
 ///
 /// Cheap to clone; all clones share one pool of workers. When the last clone is dropped, the
-/// dispatcher and its workers are stopped.
+/// workers are killed.
 #[derive(Clone)]
 pub struct Sandbox(Arc<Shared>);
 
-/// A compiled filter, see [`Sandbox::compile`]. Cheap to clone.
+/// A filter that compiles, see [`Sandbox::compile`]. Cheap to clone.
 #[derive(Clone)]
-pub struct Filter(Arc<FilterInner>);
+pub struct Filter(Arc<str>);
 
-struct FilterInner {
-    /// Unique in the process, so that a filter compiled by one sandbox can be run by another.
-    id: u64,
-    source: Box<str>,
-    sandbox: Weak<Shared>,
-}
-
-/// An encoded input, see [`Sandbox::input`]. Cheap to clone.
+/// An input serialized as JSON, see [`Sandbox::input`]. Cheap to clone.
 #[derive(Clone)]
-pub struct Input(Arc<InputInner>);
-
-enum InputInner {
-    /// In the arena of the sandbox that encoded it.
-    Arena(Slot),
-    /// The arena had no room. Sent along with every evaluation.
-    Inline(Box<[u8]>),
-}
-
-impl InputInner {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Arena(slot) => slot.bytes(),
-            Self::Inline(bytes) => bytes,
-        }
-    }
-}
-
-static NEXT_FILTER_ID: AtomicU64 = AtomicU64::new(1);
+pub struct Input(Arc<[u8]>);
 
 struct Shared {
     config: Config,
-    /// Service --spawn and release requests--> dispatcher. Locked for a whole request and its
-    /// reply, which is what pairs each reply with its request.
-    ///
-    /// Declared before `reaper`, see [`Dispatcher`].
-    control: Mutex<AsyncFd<OwnedFd>>,
     /// Workers that are alive and not evaluating anything.
-    idle: StdMutex<Vec<Worker>>,
+    idle: Mutex<Vec<Worker>>,
     /// One permit per worker that may exist.
     permits: Arc<Semaphore>,
     workers_spawned: AtomicU64,
-    /// Which filters the workers hold, and which of those are no longer wanted.
-    registry: StdMutex<Registry>,
-    /// Bumped whenever a filter is retired, so that a worker only looks for filters to forget
-    /// when there may be some.
-    retired_generation: AtomicU64,
-    /// Workers forked for a caller that went away before it could take them. Released with the
-    /// next request to the dispatcher.
-    orphans: StdMutex<Vec<Pid>>,
-    arena: Arc<Arena>,
-    _reaper: Reaper,
-}
-
-#[derive(Default)]
-struct Registry {
-    /// How many workers hold each filter.
-    known_by: HashMap<u64, usize>,
-    /// Filters whose last handle is gone and that some worker still holds.
-    retired: HashSet<u64>,
-}
-
-impl Registry {
-    fn learned(&mut self, id: u64) {
-        *self.known_by.entry(id).or_default() += 1;
-    }
-
-    fn forgot(&mut self, id: u64) {
-        if let Entry::Occupied(mut entry) = self.known_by.entry(id) {
-            *entry.get_mut() -= 1;
-            if *entry.get() == 0 {
-                entry.remove();
-                self.retired.remove(&id);
-            }
-        }
-    }
-}
-
-/// What the service knows about one filter a worker holds.
-struct Known {
-    cost: usize,
-    last_used: u64,
+    trampoline: Mutex<Trampoline>,
 }
 
 struct Worker {
-    pid: Pid,
-    /// Service --requests--> worker, and the replies back.
-    stream: UnixStream,
-    progress: Progress,
-    /// The part of a reply read so far.
-    replies: Vec<u8>,
-    /// Mirror of the worker's filter cache.
-    known: HashMap<u64, Known>,
-    known_cost: usize,
-    /// Counts requests, to find the filters used least recently.
-    clock: u64,
-    retired_seen: u64,
-}
-
-/// How an exchange with a worker failed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Failure {
-    /// The request could not be written, so the worker was dead before it saw the request.
-    NotDelivered,
-    /// The worker took the request and closed its socket without answering: it died over it.
-    NoReply,
-    /// The worker made no progress for the whole wall-clock limit.
-    TimedOut,
-}
-
-/// A worker died over a request.
-struct Death {
-    error: Error,
-    failure: Failure,
-    /// How many filters of the request had started, the last of them the one it died over.
-    started: usize,
-    /// Verdicts of the filters that finished.
-    verdicts: Vec<u8>,
-}
-
-/// How much of a worker's memory its cache of compiled filters may take, by [`filter_cost`].
-fn cache_budget(config: &Config) -> usize {
-    usize::try_from(config.memory / 4).unwrap_or(usize::MAX)
-}
-
-/// Estimated memory of a compiled filter in a worker. Compiled with the parts of jaq's library
-/// it uses, a filter typically holds a few kilobytes, growing with its source.
-fn filter_cost(source: &str) -> usize {
-    8192 + 128 * source.len()
-}
-
-impl Worker {
-    fn new(pid: Pid, socket: OwnedFd, progress: OwnedFd) -> io::Result<Self> {
-        let progress = Progress::new(Mapping::new(progress.as_fd(), PAGE_LEN, true)?)?;
-        let stream = StdUnixStream::from(socket);
-        stream.set_nonblocking(true)?;
-        Ok(Self {
-            pid,
-            stream: UnixStream::from_std(stream)?,
-            progress,
-            replies: Vec::new(),
-            known: HashMap::new(),
-            known_cost: 0,
-            clock: 0,
-            retired_seen: 0,
-        })
-    }
-
-    /// Records that the worker holds `id`. Reports whether that is new.
-    fn learn(&mut self, registry: &mut Registry, id: u64, cost: usize) -> bool {
-        match self.known.entry(id) {
-            Entry::Vacant(entry) => {
-                entry.insert(Known {
-                    cost,
-                    last_used: self.clock,
-                });
-                self.known_cost += cost;
-                registry.learned(id);
-                true
-            }
-            Entry::Occupied(_) => false,
-        }
-    }
-
-    fn forget(&mut self, registry: &mut Registry, id: u64) -> bool {
-        match self.known.remove(&id) {
-            Some(known) => {
-                self.known_cost -= known.cost;
-                registry.forgot(id);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Updates the cache mirror for a request with `filters`, collects the ids the worker is to
-    /// forget into `forget`, and returns, for each filter, whether its source must be sent.
-    fn prepare(
-        &mut self,
-        shared: &Shared,
-        filters: &[&FilterInner],
-        forget: &mut Vec<u64>,
-    ) -> Vec<bool> {
-        forget.clear();
-        self.clock += 1;
-        let clock = self.clock;
-        // Marked first, so that nothing this request uses is evicted below.
-        let mut send = Vec::with_capacity(filters.len());
-        for filter in filters {
-            match self.known.get_mut(&filter.id) {
-                Some(known) => {
-                    known.last_used = clock;
-                    send.push(false);
-                }
-                None => send.push(true),
-            }
-        }
-
-        let generation = shared.retired_generation.load(Ordering::Acquire);
-        if !send.contains(&true) && generation == self.retired_seen {
-            return send;
-        }
-        let mut registry = shared.registry();
-        if generation != self.retired_seen {
-            let retired: Vec<u64> = self
-                .known
-                .keys()
-                .filter(|id| registry.retired.contains(id))
-                .take(wire::MAX_FORGET)
-                .copied()
-                .collect();
-            // With more to forget than one request carries, the rest go with the next one.
-            if retired.len() < wire::MAX_FORGET {
-                self.retired_seen = generation;
-            }
-            for id in retired {
-                self.forget(&mut registry, id);
-                forget.push(id);
-            }
-        }
-        for (filter, send) in filters.iter().zip(&mut send) {
-            // A filter listed twice is sent in full only the first time.
-            if *send && !self.learn(&mut registry, filter.id, filter_cost(&filter.source)) {
-                *send = false;
-            }
-        }
-        let budget = cache_budget(&shared.config);
-        while self.known_cost > budget && forget.len() < wire::MAX_FORGET {
-            let oldest = self
-                .known
-                .iter()
-                .filter(|(_, known)| known.last_used < clock)
-                .min_by_key(|(_, known)| known.last_used)
-                .map(|(id, _)| *id);
-            let Some(oldest) = oldest else { break };
-            self.forget(&mut registry, oldest);
-            forget.push(oldest);
-        }
-        send
-    }
-
-    async fn send(&mut self, request: &[u8]) -> io::Result<()> {
-        self.stream.write_all(request).await
-    }
-
-    /// Reads the next reply. Cancel safe: what was read so far is kept for the next call.
-    async fn receive(&mut self) -> io::Result<Reply> {
-        loop {
-            if let Some(reply) = Reply::take(&mut self.replies)? {
-                return Ok(reply);
-            }
-            if self.stream.read_buf(&mut self.replies).await? == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-        }
-    }
-
-    /// Waits for the reply for as long as the worker keeps making progress: the wall clock is
-    /// the limit of each filter in the request, not of the whole request.
-    async fn receive_within(&mut self, wall_time: Duration) -> Result<Reply, Failure> {
-        // The service resets the page before each request, and the first filter starting is
-        // not progress yet.
-        let mut seen = 1;
-        loop {
-            match timeout(wall_time, self.receive()).await {
-                Ok(Ok(reply)) => return Ok(reply),
-                Ok(Err(_)) => return Err(Failure::NoReply),
-                Err(_) => {
-                    let started = self.progress.started();
-                    if started <= seen {
-                        return Err(Failure::TimedOut);
-                    }
-                    seen = started;
-                }
-            }
-        }
-    }
-}
-
-/// State of a worker that an operation has taken from the pool.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Between requests: the worker can go back to the pool as it is.
-    Idle,
-    /// A request is being written. If that is cut short, the worker's stream is unusable.
-    Sending,
-    /// The request is written and the reply is not read yet.
-    Waiting,
-}
-
-/// A permit, and the worker it lets an operation use.
-///
-/// Dropped in the middle of an exchange, because the caller stopped waiting, it finishes the
-/// exchange in a task of its own: the worker either answers and goes back to the pool, or dies
-/// and is released. Nothing is spawned on the normal path.
-struct Busy {
-    shared: Arc<Shared>,
-    worker: Option<Worker>,
-    state: State,
-    permit: Option<OwnedSemaphorePermit>,
-    /// Keeps the input's slot from being reused while a worker may be reading it.
-    input: Option<Input>,
-}
-
-impl Busy {
-    async fn new(shared: &Arc<Shared>, input: Option<Input>) -> Self {
-        let permit = shared
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            // The semaphore is never closed.
-            .expect("the worker semaphore is closed");
-        Self {
-            shared: shared.clone(),
-            worker: None,
-            state: State::Idle,
-            permit: Some(permit),
-            input,
-        }
-    }
-
-    /// The worker to use next, from the pool if one is idle. Reports whether it came from the
-    /// pool, and could have died there unnoticed.
-    async fn worker(&mut self) -> Result<(&mut Worker, bool), Error> {
-        let pooled = match self.worker {
-            Some(_) => true,
-            None => {
-                let idle = self.shared.idle().pop();
-                let pooled = idle.is_some();
-                let worker = match idle {
-                    Some(worker) => worker,
-                    None => self.shared.spawn().await?,
-                };
-                self.worker = Some(worker);
-                pooled
-            }
-        };
-        match &mut self.worker {
-            Some(worker) => Ok((worker, pooled)),
-            None => unreachable!("a worker was just put in place"),
-        }
-    }
-
-    async fn exchange(&mut self, request: &[u8]) -> Result<Reply, Death> {
-        let wall_time = self.shared.config.wall_time;
-        let Some(worker) = &mut self.worker else {
-            unreachable!("`exchange` is called with a worker in place");
-        };
-        worker.progress.reset();
-
-        self.state = State::Sending;
-        if worker.send(request).await.is_err() {
-            return Err(self.died(Failure::NotDelivered).await);
-        }
-        self.state = State::Waiting;
-        match worker.receive_within(wall_time).await {
-            Ok(reply) => {
-                self.state = State::Idle;
-                Ok(reply)
-            }
-            Err(failure) => Err(self.died(failure).await),
-        }
-    }
-
-    async fn died(&mut self, failure: Failure) -> Death {
-        self.state = State::Idle;
-        let Some(worker) = self.worker.take() else {
-            unreachable!("only a worker in place can die");
-        };
-        let started = worker.progress.started().min(MAX_BATCH);
-        let verdicts = (0..started.saturating_sub(1))
-            .map(|index| {
-                worker
-                    .progress
-                    .verdict(index)
-                    .unwrap_or(verdict::INVALID_FILTER)
-            })
-            .collect();
-        let error = self
-            .shared
-            .release(worker, failure == Failure::TimedOut)
-            .await;
-        Death {
-            error,
-            failure,
-            started,
-            verdicts,
-        }
-    }
-}
-
-impl Drop for Busy {
-    fn drop(&mut self) {
-        let Some(mut worker) = self.worker.take() else {
-            return;
-        };
-        if self.state == State::Idle {
-            self.shared.idle().push(worker);
-            return;
-        }
-
-        let Ok(runtime) = Handle::try_current() else {
-            // Nothing can wait for the worker here. The dispatcher kills it with the next
-            // request it gets.
-            self.shared.discard_known(&mut worker);
-            self.shared.orphans().push(worker.pid);
-            return;
-        };
-        let shared = self.shared.clone();
-        let state = self.state;
-        let permit = self.permit.take();
-        let input = self.input.take();
-        runtime.spawn(async move {
-            let _held_until_done = (permit, input);
-            if state == State::Waiting
-                && worker.receive_within(shared.config.wall_time).await.is_ok()
-            {
-                shared.idle().push(worker);
-            } else {
-                let _ = shared.release(worker, false).await;
-            }
-        });
-    }
+    process: Child,
+    stream: BufReader<UnixStream>,
 }
 
 impl Sandbox {
-    pub(crate) fn new(dispatcher: Dispatcher) -> io::Result<Self> {
-        let Dispatcher {
-            control,
-            reaper,
-            config,
-            arena,
-        } = dispatcher;
-        // `control` moves into the call, so on failure it is closed by the time `reaper` is
-        // dropped and waits for the dispatcher to exit.
-        let control = register(control)?;
+    /// Creates the sandbox, forking the trampoline that workers will be forked from.
+    ///
+    /// Must be called before the process starts its first thread, which in practice means at the
+    /// very top of `main`, ahead of building the tokio runtime. A `fork` copies only the calling
+    /// thread: locks held by any other thread at that instant, the allocator's included, would
+    /// stay locked forever in the child. The call fails if the process already has more than one
+    /// thread.
+    ///
+    /// Calling it this early also keeps the service's secrets out of the workers: whatever the
+    /// process has not loaded yet is not in the copy.
+    ///
+    /// Evaluations must run within a tokio runtime.
+    pub fn new(config: Config) -> io::Result<Self> {
+        if config.workers == 0 || config.cpu_time.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "`workers` and `cpu_time` must not be zero",
+            ));
+        }
+        if u32::try_from(config.max_filter_len).is_err()
+            || u32::try_from(config.max_input_len).is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "`max_filter_len` and `max_input_len` must fit in 32 bits",
+            ));
+        }
+
+        let worker_config = config.clone();
+        let trampoline = Trampoline::create(move || {
+            // Neither the trampoline nor its workers need any privilege the service may have.
+            // Workers inherit the dropped state.
+            prctl::set_no_new_privs()?;
+            for set in [
+                CapSet::Ambient,
+                CapSet::Inheritable,
+                CapSet::Effective,
+                CapSet::Permitted,
+            ] {
+                caps::clear(None, set).map_err(io::Error::other)?;
+            }
+            // Parsing jaq's library here, once, spares every worker doing it.
+            jq::init();
+            let data_limit = data_size()? + worker_config.memory;
+            Ok(move |socket| worker::run(socket, &worker_config, data_limit))
+        })?;
 
         Ok(Self(Arc::new(Shared {
+            idle: Mutex::default(),
             permits: Arc::new(Semaphore::new(config.workers)),
-            config,
-            control: Mutex::new(control),
-            idle: StdMutex::default(),
             workers_spawned: AtomicU64::new(0),
-            registry: StdMutex::default(),
-            retired_generation: AtomicU64::new(0),
-            orphans: StdMutex::default(),
-            arena: Arc::new(Arena::new(arena)),
-            _reaper: reaper,
+            trampoline: Mutex::new(trampoline),
+            config,
         })))
     }
 
-    /// Compiles `source` into a filter that can be evaluated any number of times.
+    /// Checks that `source` compiles, and returns it as a filter to evaluate.
     ///
     /// Compiling runs in a worker, under the same limits as an evaluation: compiling hostile
-    /// source can exhaust the stack just like running it. The worker keeps the result, and the
-    /// other workers compile the filter the first time they run it.
+    /// source can exhaust the stack just like running it.
     pub async fn compile(&self, source: &str) -> Result<Filter, Error> {
-        self.check_len(source)?;
-        // Made first, so that if the caller stops waiting, dropping it retires the filter on the
-        // worker that compiled it.
-        let filter = Filter(Arc::new(FilterInner {
-            id: NEXT_FILTER_ID.fetch_add(1, Ordering::Relaxed),
-            source: source.into(),
-            sandbox: Arc::downgrade(&self.0),
-        }));
-        self.check_as(Some(&filter.0), source).await?;
-        Ok(filter)
+        self.check(source).await?;
+        Ok(Filter(source.into()))
     }
 
-    /// Checks that `source` compiles, without keeping the result.
+    /// Checks that `source` compiles.
     pub async fn check(&self, source: &str) -> Result<(), Error> {
-        self.check_len(source)?;
-        self.check_as(None, source).await
+        let limit = self.0.config.max_filter_len;
+        if source.len() > limit {
+            return Err(Error::FilterTooLarge {
+                len: source.len(),
+                limit,
+            });
+        }
+
+        let mut lease = Lease::new(&self.0).await?;
+        let request = wire::encode_check(source);
+        let stream = &mut lease.worker().stream;
+        let exchange = async {
+            stream.write_all(&request).await?;
+            match stream.read_u8().await? {
+                wire::VALID => Ok(Ok(())),
+                wire::INVALID => Ok(Err(wire::read_message(stream).await?)),
+                _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
+            }
+        };
+        match timeout(self.0.config.wall_time, exchange).await {
+            Ok(Ok(result)) => {
+                lease.release();
+                result.map_err(Error::InvalidFilter)
+            }
+            Ok(Err(_)) => Err(lease.died(false).await),
+            Err(_) => Err(lease.died(true).await),
+        }
     }
 
-    /// Encodes `value` for evaluation. Encoded once, an input can be passed to any number of
-    /// evaluations, concurrent ones included.
-    ///
-    /// `value` is serialized directly, without building a `serde_json::Value` first. It is read
-    /// by filters as its JSON serialization would be: structs and maps are objects, sequences
-    /// are arrays, enums follow serde's externally tagged representation.
+    /// Serializes `value` for evaluation. An input can be passed to any number of evaluations,
+    /// concurrent ones included. It is read by filters as its JSON serialization.
     pub fn input<T: Serialize + ?Sized>(&self, value: &T) -> Result<Input, Error> {
-        thread_local! {
-            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
         let limit = self.0.config.max_input_len;
-        SCRATCH.with_borrow_mut(|scratch| {
-            let encoded = doc::encode(value, limit, scratch);
-            let input = encoded.map(|()| match self.0.arena.alloc(scratch) {
-                Some(slot) => InputInner::Arena(slot),
-                None => InputInner::Inline(scratch.as_slice().into()),
-            });
-            // Not kept around at the size of the largest input this thread ever encoded.
-            if scratch.capacity() > 1 << 20 {
-                *scratch = Vec::new();
-            }
-            match input {
-                Ok(input) => Ok(Input(Arc::new(input))),
-                Err(EncodeError::TooLarge) => Err(Error::InputTooLarge { limit }),
-                Err(EncodeError::Invalid(message)) => Err(Error::InvalidInput(message)),
-            }
-        })
+        let json =
+            serde_json::to_vec(value).map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if json.len() > limit {
+            return Err(Error::InputTooLarge { limit });
+        }
+        Ok(Input(json.into()))
     }
 
     /// Runs `filter` on `input` and reports whether it matched: the filter's first boolean output
     /// decides, and a filter that outputs no boolean does not match.
     ///
-    /// The evaluation is not cancelled when the returned future is dropped. It runs to its
-    /// verdict or to one of its limits either way, and its worker goes back to the pool.
+    /// Dropping the returned future kills the worker it runs on.
     pub async fn evaluate(&self, filter: &Filter, input: &Input) -> Result<bool, Error> {
         self.evaluate_many(&[filter], input)
             .await
@@ -594,146 +180,96 @@ impl Sandbox {
     /// Runs every filter on `input`, and reports each one's verdict as
     /// [`evaluate`](Self::evaluate) does, in the same order.
     ///
-    /// The filters run one after another in one worker, which reads the input once for all of
-    /// them, in a single round trip. Each has its own CPU-time and wall-clock limits. A filter
-    /// that kills its worker gets the error, and does not affect the others.
+    /// The filters run one after another in one worker, which parses the input once for all of
+    /// them. Each has its own CPU-time and wall-clock limits. A filter that kills its worker gets
+    /// the error, and the filters after it go on on another worker.
     pub async fn evaluate_many(
         &self,
         filters: &[&Filter],
         input: &Input,
     ) -> Vec<Result<bool, Error>> {
-        let shared = &self.0;
-        let mut results: Vec<Option<Result<bool, Error>>> = std::iter::repeat_with(|| None)
-            .take(filters.len())
-            .collect();
-        if filters.is_empty() {
-            return Vec::new();
-        }
-
-        let (input_at, inline) = match &*input.0 {
-            InputInner::Arena(slot) if slot.is_in(&shared.arena) => (
-                InputAt::Arena {
-                    offset: slot.offset(),
-                    len: slot.len(),
-                },
-                &[][..],
-            ),
-            other => {
-                let bytes = other.bytes();
-                (InputAt::Inline { len: bytes.len() }, bytes)
-            }
-        };
-
-        // An input encoded by another sandbox, with a larger limit.
-        let limit = shared.config.max_input_len;
-        if inline.len() > limit {
-            return std::iter::repeat_with(|| Err(Error::InputTooLarge { limit }))
-                .take(filters.len())
+        // An input made by another sandbox, with a larger limit.
+        let limit = self.0.config.max_input_len;
+        if input.0.len() > limit {
+            return filters
+                .iter()
+                .map(|_| Err(Error::InputTooLarge { limit }))
                 .collect();
         }
 
-        let mut busy = Busy::new(shared, Some(input.clone())).await;
-        // Indices of the filters without a verdict yet, in order.
-        let mut pending: Vec<usize> = (0..filters.len()).collect();
-        let (mut request, mut forget) = (Vec::new(), Vec::new());
+        let mut results = Vec::with_capacity(filters.len());
+        while let Some(rest) = filters.get(results.len()..)
+            && !rest.is_empty()
+        {
+            // As many filters as fit in one request, and at least one.
+            let mut bytes = 0;
+            let count = rest
+                .iter()
+                .take(wire::MAX_FILTERS)
+                .take_while(|filter| {
+                    bytes += filter.0.len();
+                    bytes <= MAX_REQUEST_SOURCES
+                })
+                .count()
+                .max(1);
+            self.evaluate_some(rest.get(..count).unwrap_or_default(), input, &mut results)
+                .await;
+        }
+        results
+    }
 
-        while !pending.is_empty() {
-            let (worker, pooled) = match busy.worker().await {
-                Ok(worker) => worker,
-                Err(error) => {
-                    for &index in &pending {
-                        set(&mut results, index, Err(error.duplicate()));
-                    }
-                    break;
-                }
-            };
-            // As many filters as one request carries, and no more distinct ones than the worker
-            // can keep compiled at once.
-            let budget = cache_budget(&shared.config);
-            let (mut chunk, mut distinct, mut cost) = (Vec::new(), HashSet::new(), 0);
-            for filter in pending.iter().filter_map(|&index| filters.get(index)) {
-                let filter = &*filter.0;
-                if distinct.insert(filter.id) {
-                    cost += filter_cost(&filter.source);
-                }
-                if chunk.len() == MAX_BATCH || (cost > budget && !chunk.is_empty()) {
-                    break;
-                }
-                chunk.push(filter);
-            }
-            let send = worker.prepare(shared, &chunk, &mut forget);
-            let refs = chunk.iter().zip(&send).map(|(filter, send)| FilterRef {
-                id: filter.id,
-                source: send.then_some(&*filter.source),
-            });
-            wire::encode_evaluate(&mut request, input_at, inline, &forget, refs);
+    /// Runs `filters` on one worker, and pushes the results of the ones it got to, at least the
+    /// first one, to `results`.
+    async fn evaluate_some(
+        &self,
+        filters: &[&Filter],
+        input: &Input,
+        results: &mut Vec<Result<bool, Error>>,
+    ) {
+        let all = |results: &mut Vec<_>, error: Error| {
+            results.extend(filters.iter().map(|_| Err(error.duplicate())));
+        };
+        let mut lease = match Lease::new(&self.0).await {
+            Ok(lease) => lease,
+            Err(error) => return all(results, error),
+        };
+        let wall_time = self.0.config.wall_time;
+        let request = wire::encode_evaluate(&input.0, filters.iter().map(|filter| &*filter.0));
+        let stream = &mut lease.worker().stream;
 
-            match busy.exchange(&request).await {
-                Ok(reply) => {
-                    let progress = match (&reply, &busy.worker) {
-                        (Reply::Evaluated, Some(worker)) => Some(&worker.progress),
-                        _ => None,
-                    };
-                    for (position, &index) in pending.iter().take(chunk.len()).enumerate() {
-                        set(
-                            &mut results,
-                            index,
-                            match progress.map(|p| p.verdict(position)) {
-                                Some(Some(verdict::TRUE)) => Ok(true),
-                                Some(Some(verdict::FALSE)) => Ok(false),
-                                Some(_) => Err(Error::InvalidFilter(
-                                    "the worker could not compile the filter".to_owned(),
-                                )),
-                                None => Err(unexpected(&reply)),
-                            },
-                        );
-                    }
-                    pending.drain(..chunk.len());
-                }
-                // A worker from the pool that died while idle, killed by something outside the
-                // sandbox. That is not this evaluation's doing, so it gets another worker. A
-                // worker forked for this very request is not retried, which bounds the loop.
-                Err(death) if death.failure == Failure::NotDelivered && pooled => {
-                    if let Error::Unavailable(error) = death.error {
-                        for &index in &pending {
-                            set(
-                                &mut results,
-                                index,
-                                Err(Error::Unavailable(error.duplicate_io())),
-                            );
-                        }
-                        break;
-                    }
-                }
-                Err(death) => {
-                    let resolved = match death.started.min(chunk.len()) {
-                        // Died before it started any filter: every one of them gets the error.
-                        0 => chunk.len(),
-                        started => started,
-                    };
-                    for (position, &index) in pending.iter().take(resolved).enumerate() {
-                        let verdict = death.verdicts.get(position).copied();
-                        set(
-                            &mut results,
-                            index,
-                            match verdict {
-                                Some(verdict::TRUE) => Ok(true),
-                                Some(verdict::FALSE) => Ok(false),
-                                _ => Err(death.error.duplicate()),
-                            },
-                        );
-                    }
-                    pending.drain(..resolved);
-                }
+        // The wall clock restarts with every reply byte: each one means the worker made progress.
+        let exchange = async {
+            stream.write_all(&request).await?;
+            stream.read_u8().await
+        };
+        match timeout(wall_time, exchange).await {
+            Ok(Ok(wire::INPUT_OK)) => {}
+            Ok(Ok(wire::INPUT_INVALID)) => {
+                lease.release();
+                return all(
+                    results,
+                    Error::InvalidInput("the input is not valid JSON".into()),
+                );
             }
+            // The input killed the worker, so it would kill it for every filter.
+            Ok(_) => return all(results, lease.died(false).await),
+            Err(_) => return all(results, lease.died(true).await),
         }
 
-        results
-            .into_iter()
-            .map(|result| {
-                result.unwrap_or_else(|| Err(Error::Unavailable(io::ErrorKind::Interrupted.into())))
-            })
-            .collect()
+        for _ in filters {
+            let stream = &mut lease.worker().stream;
+            let result = match timeout(wall_time, stream.read_u8()).await {
+                Ok(Ok(verdict::TRUE)) => Ok(true),
+                Ok(Ok(verdict::FALSE)) => Ok(false),
+                Ok(Ok(verdict::INVALID_FILTER)) => Err(Error::InvalidFilter(
+                    "the worker could not compile the filter".to_owned(),
+                )),
+                Ok(_) => return results.push(Err(lease.died(false).await)),
+                Err(_) => return results.push(Err(lease.died(true).await)),
+            };
+            results.push(result);
+        }
+        lease.release();
     }
 
     /// How many workers have been forked so far. Each one beyond the pool size replaced a worker
@@ -741,65 +277,150 @@ impl Sandbox {
     pub fn workers_spawned(&self) -> u64 {
         self.0.workers_spawned.load(Ordering::Relaxed)
     }
+}
 
-    fn check_len(&self, source: &str) -> Result<(), Error> {
-        let limit = self.0.config.max_filter_len;
-        if source.len() > limit {
-            return Err(Error::FilterTooLarge {
-                len: source.len(),
-                limit,
-            });
-        }
-        Ok(())
-    }
+/// A permit, and the worker it lets an operation use.
+///
+/// An operation either gives the worker back with [`Lease::release`] or reports it dead with
+/// [`Lease::died`]. Dropped with the worker still in it, because the caller stopped waiting in
+/// the middle of an exchange, it kills the worker.
+struct Lease {
+    shared: Arc<Shared>,
+    worker: Option<Worker>,
+    permit: Option<OwnedSemaphorePermit>,
+}
 
-    /// Compiles `source` on a worker, which keeps it as `filter` if there is one.
-    async fn check_as(&self, filter: Option<&FilterInner>, source: &str) -> Result<(), Error> {
-        let shared = &self.0;
-        let mut request = Vec::new();
-        wire::encode_check(&mut request, filter.map_or(0, |filter| filter.id), source);
-        let mut busy = Busy::new(shared, None).await;
-        loop {
-            let (worker, pooled) = busy.worker().await?;
-            // Recorded before sending: if the caller stops waiting, the dropped handle retires
-            // the filter, and the worker is told to forget it.
-            if let Some(filter) = filter {
-                worker.learn(&mut shared.registry(), filter.id, filter_cost(source));
+impl Lease {
+    async fn new(shared: &Arc<Shared>) -> Result<Self, Error> {
+        let permit = shared
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            // The semaphore is never closed.
+            .expect("the worker semaphore is closed");
+        let worker = loop {
+            match shared.idle().pop() {
+                // Killed while idle, by something outside the sandbox such as the kernel's
+                // out-of-memory killer. Dropping it reaps it.
+                Some(worker) if worker.process.has_exited() => continue,
+                Some(worker) => break worker,
+                None => break shared.spawn()?,
             }
-            match busy.exchange(&request).await {
-                Ok(Reply::Valid) => return Ok(()),
-                Ok(Reply::InvalidFilter(message)) => {
-                    if let (Some(filter), Some(worker)) = (filter, &mut busy.worker) {
-                        worker.forget(&mut shared.registry(), filter.id);
-                    }
-                    return Err(Error::InvalidFilter(message));
-                }
-                Ok(reply) => return Err(unexpected(&reply)),
-                Err(death) if death.failure == Failure::NotDelivered && pooled => {
-                    if let Error::Unavailable(error) = death.error {
-                        return Err(Error::Unavailable(error));
-                    }
-                }
-                Err(death) => return Err(death.error),
-            }
+        };
+        Ok(Self {
+            shared: shared.clone(),
+            worker: Some(worker),
+            permit: Some(permit),
+        })
+    }
+
+    fn worker(&mut self) -> &mut Worker {
+        match &mut self.worker {
+            Some(worker) => worker,
+            None => unreachable!("a lease holds its worker until it is released"),
+        }
+    }
+
+    /// Gives the worker back to the pool.
+    fn release(mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.shared.idle().push(worker);
+        }
+    }
+
+    /// Kills the worker, which a dead worker does not notice, and turns the way it ended into
+    /// the error of the operation that was running on it.
+    async fn died(mut self, timed_out: bool) -> Error {
+        let Some(worker) = self.worker.take() else {
+            unreachable!("a lease holds its worker until it is released");
+        };
+        if let Err(error) = worker.process.kill() {
+            return Error::Unavailable(error);
+        }
+        match worker.process.wait().await {
+            Ok(status) => error_for(status, timed_out),
+            Err(error) => Error::Unavailable(error),
         }
     }
 }
 
-fn set<T>(slots: &mut [Option<T>], index: usize, value: T) {
-    if let Some(slot) = slots.get_mut(index) {
-        *slot = Some(value);
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let _ = worker.process.kill();
+        let permit = self.permit.take();
+        match Handle::try_current() {
+            // Reaped without blocking. The permit is held until then, so that the pool never has
+            // more processes than its size.
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = worker.process.wait().await;
+                    drop(permit);
+                });
+            }
+            // Dropping the worker reaps it.
+            Err(_) => drop(worker),
+        }
     }
 }
 
-trait DuplicateIo {
-    fn duplicate_io(&self) -> io::Error;
+/// What a worker's end says about the operation that was running on it.
+fn error_for(status: WaitStatus, timed_out: bool) -> Error {
+    match status {
+        WaitStatus::Signaled(_, CPU_TIME_SIGNAL, _) => Error::LimitExceeded(Limit::CpuTime),
+        WaitStatus::Signaled(_, MEMORY_SIGNAL, _) => Error::LimitExceeded(Limit::Memory),
+        WaitStatus::Signaled(_, STACK_SIGNAL, _) => Error::LimitExceeded(Limit::Stack),
+        // The worker was still running when it was killed for taking too long.
+        WaitStatus::Signaled(_, Signal::SIGKILL, _) if timed_out => {
+            Error::LimitExceeded(Limit::WallTime)
+        }
+        // Includes a `SIGKILL` nobody here sent, such as the kernel's out-of-memory killer.
+        WaitStatus::Signaled(_, signal, _) => Error::WorkerDied(format!("killed by {signal}")),
+        WaitStatus::Exited(_, code) => Error::WorkerDied(format!("exited with code {code}")),
+        other => Error::WorkerDied(format!("ended with {other:?}")),
+    }
 }
 
-impl DuplicateIo for io::Error {
-    fn duplicate_io(&self) -> io::Error {
-        io::Error::new(self.kind(), self.to_string())
+impl Shared {
+    fn idle(&self) -> MutexGuard<'_, Vec<Worker>> {
+        // Nothing that can panic runs while these locks are held, and what they guard stays
+        // valid regardless.
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Forks a worker. Blocks the thread for the fork, which is short.
+    fn spawn(&self) -> Result<Worker, Error> {
+        let (process, stream) = self
+            .trampoline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .spawn()
+            .map_err(Error::Unavailable)?;
+        self.workers_spawned.fetch_add(1, Ordering::Relaxed);
+        // On failure, dropping `process` kills the worker.
+        let stream = stream
+            .set_nonblocking(true)
+            .and_then(|()| UnixStream::from_std(stream))
+            .map_err(Error::Unavailable)?;
+        Ok(Worker {
+            process,
+            stream: BufReader::new(stream),
+        })
+    }
+}
+
+/// Size in bytes of the mappings that `RLIMIT_DATA` is charged against.
+fn data_size() -> io::Result<u64> {
+    fs::read_to_string("/proc/self/status")?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmData:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kilobytes| kilobytes.parse::<u64>().ok())
+        .map(|kilobytes| kilobytes * 1024)
+        .ok_or_else(|| io::Error::other("no `VmData:` in /proc/self/status"))
 }
 
 impl fmt::Debug for Sandbox {
@@ -813,197 +434,27 @@ impl fmt::Debug for Sandbox {
 impl Filter {
     /// The filter's source.
     pub fn source(&self) -> &str {
-        &self.0.source
+        &self.0
     }
 }
 
 impl fmt::Debug for Filter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Filter").field(&self.0.source).finish()
-    }
-}
-
-impl Drop for FilterInner {
-    fn drop(&mut self) {
-        if let Some(shared) = self.sandbox.upgrade() {
-            let mut registry = shared.registry();
-            if registry.known_by.contains_key(&self.id) {
-                registry.retired.insert(self.id);
-                shared.retired_generation.fetch_add(1, Ordering::Release);
-            }
-        }
+        f.debug_tuple("Filter").field(&self.0).finish()
     }
 }
 
 impl Input {
-    /// Length of the encoded input in bytes.
-    pub fn len(&self) -> usize {
-        self.0.bytes().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// The input as JSON text.
+    pub fn json(&self) -> &[u8] {
+        &self.0
     }
 }
 
 impl fmt::Debug for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Input")
-            .field("len", &self.len())
-            .field("shared", &matches!(&*self.0, InputInner::Arena(_)))
+        f.debug_tuple("Input")
+            .field(&String::from_utf8_lossy(&self.0))
             .finish()
-    }
-}
-
-/// A reply that does not answer the request that was sent, which a worker never produces.
-fn unexpected(reply: &Reply) -> Error {
-    Error::Unavailable(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("unexpected reply from a jq worker: {reply:?}"),
-    ))
-}
-
-/// Makes the control socket usable from async code.
-fn register(control: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
-    Handle::try_current().map_err(io::Error::other)?;
-    let flags = OFlag::from_bits_retain(fcntl(&control, FcntlArg::F_GETFL)?);
-    fcntl(&control, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-    // Safety: `control` is an open socket that the `AsyncFd` owns from here on, so the
-    // descriptor stays valid for as long as it is registered.
-    Ok(unsafe { AsyncFd::register(control) }?)
-}
-
-impl Shared {
-    fn idle(&self) -> MutexGuard<'_, Vec<Worker>> {
-        // Nothing that can panic runs while these locks are held, and what they guard stays
-        // valid regardless.
-        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn registry(&self) -> MutexGuard<'_, Registry> {
-        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn orphans(&self) -> MutexGuard<'_, Vec<Pid>> {
-        self.orphans.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// One request to the dispatcher and its reply, in a task of its own: a caller that stops
-    /// waiting cannot cut the conversation short between the two.
-    async fn control(
-        self: &Arc<Self>,
-        request: ControlRequest,
-    ) -> io::Result<(ControlReply, Vec<OwnedFd>)> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let shared = self.clone();
-        tokio::spawn(async move {
-            let reply = shared.call(request).await;
-            if let Err(Ok((ControlReply::Spawned(pid), _))) = reply_tx.send(reply) {
-                // Forked for a caller that is gone.
-                shared.orphans().push(pid);
-            }
-        });
-        reply_rx
-            .await
-            .unwrap_or_else(|_| Err(io::Error::other("the jq sandbox is shutting down")))
-    }
-
-    async fn call(&self, request: ControlRequest) -> io::Result<(ControlReply, Vec<OwnedFd>)> {
-        let control = self.control.lock().await;
-        let orphans = std::mem::take(&mut *self.orphans());
-        for pid in orphans {
-            Self::round_trip(&control, ControlRequest::Release(pid)).await?;
-        }
-        Self::round_trip(&control, request).await
-    }
-
-    async fn round_trip(
-        control: &AsyncFd<OwnedFd>,
-        request: ControlRequest,
-    ) -> io::Result<(ControlReply, Vec<OwnedFd>)> {
-        control
-            .async_io(Interest::WRITABLE, |socket| {
-                control::send(socket.as_fd(), request.encode(), &[])
-            })
-            .await?;
-        let (message, attached) = control
-            .async_io(Interest::READABLE, |socket| {
-                control::receive(socket.as_fd())
-            })
-            .await?;
-        let reply = ControlReply::decode(message).ok_or(io::ErrorKind::InvalidData)?;
-        Ok((reply, attached))
-    }
-
-    async fn spawn(self: &Arc<Self>) -> Result<Worker, Error> {
-        let (pid, socket, progress) = match self.control(ControlRequest::Spawn).await {
-            Ok((ControlReply::Spawned(pid), attached)) => {
-                let mut attached = attached.into_iter();
-                match (attached.next(), attached.next()) {
-                    (Some(socket), Some(progress)) => (pid, socket, progress),
-                    _ => {
-                        self.orphans().push(pid);
-                        return Err(Error::Unavailable(io::ErrorKind::InvalidData.into()));
-                    }
-                }
-            }
-            Ok((ControlReply::Failed(errno), _)) => return Err(Error::Unavailable(errno.into())),
-            Ok(_) => return Err(Error::Unavailable(io::ErrorKind::InvalidData.into())),
-            Err(error) => return Err(Error::Unavailable(error)),
-        };
-        self.workers_spawned.fetch_add(1, Ordering::Relaxed);
-
-        match Worker::new(pid, socket, progress) {
-            Ok(worker) => Ok(worker),
-            Err(error) => {
-                // The worker exists but cannot be talked to; do not leave it behind.
-                let _ = self.control(ControlRequest::Release(pid)).await;
-                Err(Error::Unavailable(error))
-            }
-        }
-    }
-
-    /// Has the dispatcher kill and reap `worker`, and turns the way the worker ended into the
-    /// error of the evaluation that was running on it.
-    /// Takes the filters a worker holds off the registry, as the worker is going away.
-    fn discard_known(&self, worker: &mut Worker) {
-        let mut registry = self.registry();
-        let known: Vec<u64> = worker.known.keys().copied().collect();
-        for id in known {
-            worker.forget(&mut registry, id);
-        }
-    }
-
-    async fn release(self: &Arc<Self>, mut worker: Worker, timed_out: bool) -> Error {
-        self.discard_known(&mut worker);
-        let Worker { pid, stream, .. } = worker;
-        drop(stream);
-        let reply = match self.control(ControlRequest::Release(pid)).await {
-            Ok((reply, _)) => reply,
-            Err(error) => return Error::Unavailable(error),
-        };
-
-        match reply {
-            ControlReply::Signaled(signal) if signal == CPU_TIME_SIGNAL as i32 => {
-                Error::LimitExceeded(Limit::CpuTime)
-            }
-            ControlReply::Signaled(signal) if signal == MEMORY_SIGNAL as i32 => {
-                Error::LimitExceeded(Limit::Memory)
-            }
-            ControlReply::Signaled(signal) if signal == STACK_SIGNAL as i32 => {
-                Error::LimitExceeded(Limit::Stack)
-            }
-            // The worker was still running when the dispatcher killed it for this release.
-            ControlReply::Signaled(signal) if signal == Signal::SIGKILL as i32 && timed_out => {
-                Error::LimitExceeded(Limit::WallTime)
-            }
-            // Includes a `SIGKILL` nobody here sent, such as the kernel's out-of-memory killer.
-            ControlReply::Signaled(signal) => Error::WorkerDied(match Signal::try_from(signal) {
-                Ok(signal) => format!("killed by {signal}"),
-                Err(_) => format!("killed by signal {signal}"),
-            }),
-            ControlReply::Exited(code) => Error::WorkerDied(format!("exited with code {code}")),
-            _ => Error::WorkerDied("the dispatcher has no record of it".to_owned()),
-        }
     }
 }

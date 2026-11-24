@@ -7,14 +7,14 @@
 
 use std::process::ExitCode;
 
-use jq_sandbox::{Config, Dispatcher};
+use jq_sandbox::{Config, Sandbox};
 
 fn main() -> ExitCode {
     // Before reading input, parsing arguments or anything else that could start a thread.
-    let dispatcher = match Dispatcher::fork(Config::default()) {
-        Ok(dispatcher) => dispatcher,
+    let sandbox = match Sandbox::new(Config::default()) {
+        Ok(sandbox) => sandbox,
         Err(error) => {
-            eprintln!("failed to fork the dispatcher: {error}");
+            eprintln!("failed to create the sandbox: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -42,9 +42,6 @@ fn main() -> ExitCode {
         }
     };
     let verdict = runtime.block_on(async {
-        let sandbox = dispatcher
-            .connect()
-            .map_err(jq_sandbox::Error::Unavailable)?;
         let filter = sandbox.compile(&filter).await?;
         let input = sandbox.input(&input)?;
         sandbox.evaluate(&filter, &input).await

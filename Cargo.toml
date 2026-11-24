@@ -11,14 +11,15 @@ jaq-core = "3.1.2"
 jaq-json = "2.0.3"
 jaq-std = "3.0.4"
 libc = "0.2"
-nix = { version = "0.31", features = ["env", "fs", "mman", "process", "resource", "signal", "socket", "time", "uio"] }
+nix = { version = "0.31", features = ["env", "fs", "process", "resource", "signal", "socket", "time", "uio"] }
 serde = "1"
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[test]]
