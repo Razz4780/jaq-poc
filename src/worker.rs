@@ -79,7 +79,11 @@ fn set_up(config: &Config, data_limit: u64) -> io::Result<Timer> {
     // The worker runs on the stack of the trampoline's only thread, which the kernel grows on
     // demand up to this limit. Stack is not charged to `RLIMIT_DATA`, so without its own limit
     // (it can be "unlimited" in a container) runaway recursion would be bounded by nothing.
-    setrlimit(Resource::RLIMIT_STACK, config.stack, config.stack)?;
+    setrlimit(
+        Resource::RLIMIT_STACK,
+        config.stack.get(),
+        config.stack.get(),
+    )?;
     // Nothing below opens a file, creates one, starts a process or should leave a core dump.
     setrlimit(Resource::RLIMIT_NOFILE, 0, 0)?;
     setrlimit(Resource::RLIMIT_FSIZE, 0, 0)?;

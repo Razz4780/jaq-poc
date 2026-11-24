@@ -20,7 +20,9 @@
 //! is harmless in a single-threaded process that is not inside the allocator at the time.
 
 use std::{
-    fs, io::{self, IoSlice, IoSliceMut}, ops::Not, os::{
+    fs,
+    io::{self, IoSlice, IoSliceMut},
+    os::{
         fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::net::UnixStream,
     },
@@ -127,7 +129,7 @@ impl Drop for Child {
 /// Dropping this kills the trampoline process. Children it forked are not affected.
 pub struct Trampoline {
     /// `SOCK_SEQPACKET` used to control the trampoline process.
-    /// 
+    ///
     /// One byte asks for a new child, and the reply is a status and, attached, the
     /// child's pidfd and the parent's end of its socket.
     ///
@@ -241,7 +243,7 @@ where
             // Both descriptors are closed here, after they are sent. The trampoline must not keep
             // any end of a child's socket: later children would inherit it, and neither side
             // would ever see the other one close.
-            Ok((pidfd, socket)) => send(control.as_fd(), 0, &[pidfd.as_raw_fd(), socket.as_raw_fd()]),
+            Ok((pidfd, socket)) => send(control.as_fd(), 0, &[pidfd.as_fd(), socket.as_fd()]),
             Err(errno) => send(control.as_fd(), errno as i32, &[]),
         };
         if sent.is_err() {
@@ -364,13 +366,24 @@ fn close_inherited(control: &OwnedFd) -> io::Result<()> {
 }
 
 /// Sends one control message, a status, with `attached` passed along as file descriptors.
-fn send(socket: BorrowedFd<'_>, status: i32, attached: &[RawFd]) -> io::Result<()> {
+fn send(socket: BorrowedFd<'_>, status: i32, attached: &[BorrowedFd]) -> io::Result<()> {
     let message = status.to_le_bytes();
+    let raw_fds = attached
+        .iter()
+        .map(|borrowed| borrowed.as_raw_fd())
+        .collect::<Vec<_>>();
+    let control = [ControlMessage::ScmRights(&raw_fds)];
     let sent = sendmsg::<()>(
         socket.as_raw_fd(),
         &[IoSlice::new(&message)],
-        attached.is_empty().not().then_some([ControlMessage::ScmRights(attached)].as_slice()).unwrap_or_default(),
-        MsgFlags::MSG_NOSIGNAL, // we don't want SIGPIPE
+        if attached.is_empty() {
+            Default::default()
+        } else {
+            &control
+        },
+        // A peer that is gone must surface as an error here, whatever the process does with
+        // `SIGPIPE`: the trampoline inherits the disposition of whoever created it.
+        MsgFlags::MSG_NOSIGNAL,
         None,
     )?;
     if sent == message.len() {

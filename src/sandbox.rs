@@ -2,8 +2,11 @@
 
 use std::{
     fmt, fs, io,
-    sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    num::NonZeroU32,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use caps::CapSet;
@@ -71,18 +74,10 @@ impl Sandbox {
     ///
     /// Evaluations must run within a tokio runtime.
     pub fn new(config: Config) -> io::Result<Self> {
-        if config.workers == 0 || config.cpu_time.is_zero() {
+        if config.cpu_time.is_zero() || config.wall_time.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "`workers` and `cpu_time` must not be zero",
-            ));
-        }
-        if u32::try_from(config.max_filter_len).is_err()
-            || u32::try_from(config.max_input_len).is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "`max_filter_len` and `max_input_len` must fit in 32 bits",
+                "`cpu_time` and `wall_time` must not be zero",
             ));
         }
 
@@ -101,13 +96,13 @@ impl Sandbox {
             }
             // Parsing jaq's library here, once, spares every worker doing it.
             jq::init();
-            let data_limit = data_size()? + worker_config.memory;
+            let data_limit = data_size()? + worker_config.memory.get();
             Ok(move |socket| worker::run(socket, &worker_config, data_limit))
         })?;
 
         Ok(Self(Arc::new(Shared {
             idle: Mutex::default(),
-            permits: Arc::new(Semaphore::new(config.workers)),
+            permits: Arc::new(Semaphore::new(config.workers.get())),
             workers_spawned: AtomicU64::new(0),
             trampoline: Mutex::new(trampoline),
             config,
@@ -126,10 +121,10 @@ impl Sandbox {
     /// Checks that `source` compiles.
     pub async fn check(&self, source: &str) -> Result<(), Error> {
         let limit = self.0.config.max_filter_len;
-        if source.len() > limit {
+        if exceeds(source.len(), limit) {
             return Err(Error::FilterTooLarge {
                 len: source.len(),
-                limit,
+                limit: limit.get(),
             });
         }
 
@@ -160,8 +155,8 @@ impl Sandbox {
         let limit = self.0.config.max_input_len;
         let json =
             serde_json::to_vec(value).map_err(|error| Error::InvalidInput(error.to_string()))?;
-        if json.len() > limit {
-            return Err(Error::InputTooLarge { limit });
+        if exceeds(json.len(), limit) {
+            return Err(Error::InputTooLarge { limit: limit.get() });
         }
         Ok(Input(json.into()))
     }
@@ -174,7 +169,11 @@ impl Sandbox {
         self.evaluate_many(&[filter], input)
             .await
             .pop()
-            .unwrap_or_else(|| Err(Error::Unavailable(io::ErrorKind::InvalidData.into())))
+            .unwrap_or_else(|| {
+                Err(Error::Unavailable(Arc::new(
+                    io::ErrorKind::InvalidData.into(),
+                )))
+            })
     }
 
     /// Runs every filter on `input`, and reports each one's verdict as
@@ -190,10 +189,10 @@ impl Sandbox {
     ) -> Vec<Result<bool, Error>> {
         // An input made by another sandbox, with a larger limit.
         let limit = self.0.config.max_input_len;
-        if input.0.len() > limit {
+        if exceeds(input.0.len(), limit) {
             return filters
                 .iter()
-                .map(|_| Err(Error::InputTooLarge { limit }))
+                .map(|_| Err(Error::InputTooLarge { limit: limit.get() }))
                 .collect();
         }
 
@@ -227,7 +226,7 @@ impl Sandbox {
         results: &mut Vec<Result<bool, Error>>,
     ) {
         let all = |results: &mut Vec<_>, error: Error| {
-            results.extend(filters.iter().map(|_| Err(error.duplicate())));
+            results.extend(filters.iter().map(|_| Err(error.clone())));
         };
         let mut lease = match Lease::new(&self.0).await {
             Ok(lease) => lease,
@@ -336,11 +335,11 @@ impl Lease {
             unreachable!("a lease holds its worker until it is released");
         };
         if let Err(error) = worker.process.kill() {
-            return Error::Unavailable(error);
+            return Error::Unavailable(error.into());
         }
         match worker.process.wait().await {
             Ok(status) => error_for(status, timed_out),
-            Err(error) => Error::Unavailable(error),
+            Err(error) => Error::Unavailable(error.into()),
         }
     }
 }
@@ -398,18 +397,25 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .spawn()
+            .map_err(Arc::new)
             .map_err(Error::Unavailable)?;
         self.workers_spawned.fetch_add(1, Ordering::Relaxed);
         // On failure, dropping `process` kills the worker.
         let stream = stream
             .set_nonblocking(true)
             .and_then(|()| UnixStream::from_std(stream))
+            .map_err(Arc::new)
             .map_err(Error::Unavailable)?;
         Ok(Worker {
             process,
             stream: BufReader::new(stream),
         })
     }
+}
+
+/// Whether `len` is over `limit`.
+fn exceeds(len: usize, limit: NonZeroU32) -> bool {
+    usize::try_from(limit.get()).is_ok_and(|limit| len > limit)
 }
 
 /// Size in bytes of the mappings that `RLIMIT_DATA` is charged against.

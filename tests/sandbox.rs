@@ -9,6 +9,7 @@
 use std::{
     fs,
     future::Future,
+    num::NonZeroUsize,
     process::{Command, ExitCode},
     sync::{
         Arc,
@@ -25,7 +26,7 @@ use nix::{
 };
 use serde_json::{Value, json};
 
-const WORKERS: usize = 3;
+const WORKERS: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 const SECRET_VARIABLE: &str = "JQ_SANDBOX_TEST_SECRET";
 const BENIGN: &str = r#".priority == "high""#;
 const RUNAWAY: &str = "def f: f; f";
@@ -174,7 +175,10 @@ async fn invalid_filters(sandbox: &Sandbox) {
 async fn size_limits(sandbox: &Sandbox) {
     let limits = Config::default();
 
-    let filter = format!(r#". == "{}""#, "a".repeat(limits.max_filter_len));
+    let filter = format!(
+        r#". == "{}""#,
+        "a".repeat(limits.max_filter_len.get() as usize)
+    );
     let result = sandbox.eval(&filter, &message()).await;
     assert!(
         matches!(result, Err(Error::FilterTooLarge { .. })),
@@ -186,7 +190,7 @@ async fn size_limits(sandbox: &Sandbox) {
         "{result:?}"
     );
 
-    let input = json!("a".repeat(limits.max_input_len));
+    let input = json!("a".repeat(limits.max_input_len.get() as usize));
     let result = sandbox.input(&input);
     assert!(
         matches!(result, Err(Error::InputTooLarge { .. })),
@@ -500,7 +504,7 @@ async fn concurrency(sandbox: &Sandbox, trampolines: &[Pid]) {
                 assert!(matches!(verdict, Ok(v) if v == expected), "{verdict:?}");
             }
             let workers = workers(&trampolines).len();
-            assert!(workers <= WORKERS, "{workers} workers exist at once");
+            assert!(workers <= WORKERS.get(), "{workers} workers exist at once");
         })
     });
     for evaluation in evaluations.collect::<Vec<_>>() {
@@ -511,14 +515,14 @@ async fn concurrency(sandbox: &Sandbox, trampolines: &[Pid]) {
 /// A caller that gives up must not cost the pool a worker or leave one in a broken state.
 async fn cancellation(sandbox: &Sandbox, trampolines: &[Pid]) {
     let input = message();
-    for _ in 0..WORKERS * 2 {
+    for _ in 0..WORKERS.get() * 2 {
         let abandoned =
             tokio::time::timeout(Duration::from_millis(20), sandbox.eval(RUNAWAY, &input));
         assert!(abandoned.await.is_err(), "the caller gives up first");
     }
 
     // More evaluations than workers, started while abandoned ones may still be running.
-    let evaluations = (0..WORKERS * 3).map(|_| {
+    let evaluations = (0..WORKERS.get() * 3).map(|_| {
         let sandbox = sandbox.clone();
         tokio::spawn(async move { assert_healthy(&sandbox).await })
     });
@@ -526,7 +530,7 @@ async fn cancellation(sandbox: &Sandbox, trampolines: &[Pid]) {
         evaluation.await.unwrap();
     }
     let workers = workers(trampolines).len();
-    assert!(workers <= WORKERS, "{workers} workers exist at once");
+    assert!(workers <= WORKERS.get(), "{workers} workers exist at once");
 }
 
 /// A worker that does not answer and does not burn CPU either is caught by the wall clock.
@@ -556,7 +560,7 @@ async fn wall_clock(sandbox: &Sandbox, trampolines: &[Pid]) {
 /// Workers killed from outside while idle, as the kernel's out-of-memory killer could do, are
 /// replaced without failing the evaluation that finds them dead.
 async fn idle_workers_killed(sandbox: &Sandbox, trampolines: &[Pid]) {
-    let evaluations = (0..WORKERS).map(|_| {
+    let evaluations = (0..WORKERS.get()).map(|_| {
         let sandbox = sandbox.clone();
         tokio::spawn(async move { assert_healthy(&sandbox).await })
     });
@@ -573,7 +577,7 @@ async fn idle_workers_killed(sandbox: &Sandbox, trampolines: &[Pid]) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    for _ in 0..WORKERS * 2 {
+    for _ in 0..WORKERS.get() * 2 {
         assert_healthy(sandbox).await;
     }
 }

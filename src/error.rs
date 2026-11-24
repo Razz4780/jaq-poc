@@ -1,7 +1,7 @@
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 
 /// Why an evaluation produced no result.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone)]
 pub enum Error {
     /// The filter does not parse or compile. The message comes from the jq compiler.
     #[error("jq filter is invalid: {0}")]
@@ -12,10 +12,10 @@ pub enum Error {
     InvalidInput(String),
 
     #[error("jq filter is {len} bytes long, the limit is {limit}")]
-    FilterTooLarge { len: usize, limit: usize },
+    FilterTooLarge { len: usize, limit: u32 },
 
     #[error("input is longer than the limit of {limit} bytes")]
-    InputTooLarge { limit: usize },
+    InputTooLarge { limit: u32 },
 
     /// The evaluation ran into one of the configured limits and its worker was killed.
     #[error("jq evaluation exceeded its {0} limit")]
@@ -30,27 +30,7 @@ pub enum Error {
     /// it nothing can be evaluated, and it cannot be started again once the service runs
     /// threads.
     #[error("jq sandbox is unavailable: {0}")]
-    Unavailable(#[source] io::Error),
-}
-
-impl Error {
-    /// The same error again, for each filter of a batch that it ended.
-    pub(crate) fn duplicate(&self) -> Self {
-        match self {
-            Self::InvalidFilter(message) => Self::InvalidFilter(message.clone()),
-            Self::InvalidInput(message) => Self::InvalidInput(message.clone()),
-            Self::FilterTooLarge { len, limit } => Self::FilterTooLarge {
-                len: *len,
-                limit: *limit,
-            },
-            Self::InputTooLarge { limit } => Self::InputTooLarge { limit: *limit },
-            Self::LimitExceeded(limit) => Self::LimitExceeded(*limit),
-            Self::WorkerDied(message) => Self::WorkerDied(message.clone()),
-            Self::Unavailable(error) => {
-                Self::Unavailable(io::Error::new(error.kind(), error.to_string()))
-            }
-        }
-    }
+    Unavailable(#[source] Arc<io::Error>),
 }
 
 /// A per-evaluation limit from [`Config`](crate::Config).

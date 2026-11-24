@@ -7,13 +7,14 @@
 
 use std::{
     fs,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
 use jq_sandbox::{Config, Error, Filter, Sandbox};
 use serde_json::{Value, json};
 
-const WORKERS: usize = 4;
+const WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Private memory of this process's trampoline and of its workers, in kB, from `/proc`.
 fn private_memory() -> (u64, Vec<u64>) {
@@ -229,11 +230,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ordinary = sandbox.compile(".offset > 0").await?;
         let mut killed = Duration::ZERO;
         let mut replaced = Duration::ZERO;
-        for i in 0..200 + WORKERS {
+        for i in 0..200 + WORKERS.get() {
             let started = Instant::now();
             let result = sandbox.evaluate(&bomb, &small).await;
             assert!(matches!(result, Err(Error::LimitExceeded(_))));
-            if i >= WORKERS {
+            if i >= WORKERS.get() {
                 killed += started.elapsed();
             }
         }

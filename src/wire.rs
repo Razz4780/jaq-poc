@@ -97,7 +97,7 @@ pub fn read_request(reader: &mut impl Read, config: &Config) -> io::Result<Optio
     match tag {
         [CHECK] => Ok(Some(Request::Check(read_source(reader, config)?))),
         [EVALUATE] => {
-            let input = read_bytes(reader, config.max_input_len)?;
+            let input = read_bytes(reader, config.max_input_len.get())?;
             let count = read_len(reader, MAX_FILTERS)?;
             let filters = (0..count)
                 .map(|_| read_source(reader, config))
@@ -109,7 +109,7 @@ pub fn read_request(reader: &mut impl Read, config: &Config) -> io::Result<Optio
 }
 
 fn read_source(reader: &mut impl Read, config: &Config) -> io::Result<String> {
-    String::from_utf8(read_bytes(reader, config.max_filter_len)?)
+    String::from_utf8(read_bytes(reader, config.max_filter_len.get())?)
         .map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
@@ -122,8 +122,8 @@ fn read_len(reader: &mut impl Read, limit: usize) -> io::Result<usize> {
     }
 }
 
-fn read_bytes(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
-    let len = read_len(reader, limit)?;
+fn read_bytes(reader: &mut impl Read, limit: u32) -> io::Result<Vec<u8>> {
+    let len = read_len(reader, usize::try_from(limit).unwrap_or(usize::MAX))?;
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
@@ -144,6 +144,8 @@ pub async fn read_message(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<S
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
 
     #[test]
@@ -175,7 +177,7 @@ mod tests {
     #[test]
     fn lengths_are_bounded() {
         let config = Config {
-            max_filter_len: 4,
+            max_filter_len: NonZeroU32::new(4).unwrap(),
             ..Config::default()
         };
         let encoded = encode_check("12345");
