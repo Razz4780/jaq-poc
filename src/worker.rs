@@ -6,7 +6,7 @@
 //!
 //! | limit    | mechanism                                         | worker ends with |
 //! |----------|---------------------------------------------------|------------------|
-//! | CPU time | CPU-time timer armed around each evaluation       | `SIGXCPU`        |
+//! | CPU time | CPU-time timer armed around each filter           | `SIGXCPU`        |
 //! | memory   | `RLIMIT_DATA`; the failed allocation aborts       | `SIGABRT`        |
 //! | stack    | `RLIMIT_STACK`; the guard page faults             | `SIGSEGV`        |
 //!
@@ -17,18 +17,21 @@ use std::{
     fs::File,
     io::{self, BufReader, Write},
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     panic,
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
-use jaq_json::Val;
 use nix::{
+    errno::Errno,
     sys::{
         prctl,
         resource::{Resource, setrlimit},
         signal::{SigEvent, SigHandler, SigevNotify, Signal, signal},
+        socket::{MsgFlags, recv},
         time::TimeSpec,
         timer::{Expiration, Timer, TimerSetTimeFlags},
     },
@@ -40,7 +43,9 @@ use crate::{
     Config,
     dispatcher::exit,
     jq,
-    wire::{Kind, Reply, Request},
+    shm::{ArenaView, Mapping, PAGE_LEN, Progress, verdict},
+    value::{DocRef, Document, Value},
+    wire::{InputAt, Reply, Request, RequestBuffers},
 };
 
 /// Signal of the CPU-time timer.
@@ -54,30 +59,51 @@ pub const STACK_SIGNAL: Signal = Signal::SIGSEGV;
 const EXIT_SETUP_FAILED: i32 = 70;
 /// Exit code of a worker in which jaq panicked.
 const EXIT_PANICKED: i32 = 71;
+/// Exit code of a worker in which a value of the input outlived its evaluation, which jaq never
+/// lets happen. The input's slot in the arena may be reused once the worker replies, so a worker
+/// that still holds a view of it must not go on.
+const EXIT_INPUT_RETAINED: i32 = 72;
 
 /// The worker's whole life. `control` is the dispatcher's control socket, which this copy of the
 /// process must not keep open.
-pub fn run(
-    socket: OwnedFd,
-    control: &OwnedFd,
-    dispatcher: Pid,
-    config: &Config,
-    data_limit: u64,
-) -> ! {
-    let Ok(timer) = set_up(control, dispatcher, config, data_limit) else {
+pub struct Setup<'a> {
+    pub socket: OwnedFd,
+    /// The worker's progress page.
+    pub progress: OwnedFd,
+    /// The dispatcher's control socket, which this copy of the process must not keep open.
+    pub control: &'a OwnedFd,
+    pub dispatcher: Pid,
+    pub config: &'a Config,
+    pub data_limit: u64,
+    pub arena: &'a ArenaView,
+}
+
+/// The worker's whole life.
+pub fn run(setup: Setup<'_>) -> ! {
+    let Setup {
+        socket,
+        progress,
+        control,
+        dispatcher,
+        config,
+        data_limit,
+        arena,
+    } = setup;
+    let Ok((timer, progress)) = set_up(progress, control, dispatcher, config, data_limit) else {
         exit(EXIT_SETUP_FAILED);
     };
     // Ends when the service closes its end of the socket.
-    let _ = serve(UnixStream::from(socket), timer, config);
+    let _ = serve(UnixStream::from(socket), timer, config, arena, &progress);
     exit(0)
 }
 
 fn set_up(
+    progress: OwnedFd,
     control: &OwnedFd,
     dispatcher: Pid,
     config: &Config,
     data_limit: u64,
-) -> io::Result<Timer> {
+) -> io::Result<(Timer, Progress)> {
     close(control.as_raw_fd())?;
 
     // The dispatcher normally kills its workers before it exits. This covers a dispatcher that
@@ -97,6 +123,9 @@ fn set_up(
     dup2_stdout(&null)?;
     dup2_stderr(&null)?;
     drop(null);
+
+    // Mapped before the limits below, after which the worker holds no descriptor but its socket.
+    let progress = Progress::new(Mapping::new(progress.as_fd(), PAGE_LEN, true)?)?;
 
     setrlimit(Resource::RLIMIT_DATA, data_limit, data_limit)?;
     // The worker runs on the stack of the dispatcher's only thread, which the kernel grows on
@@ -129,80 +158,116 @@ fn set_up(
             si_value: 0,
         }),
     )?;
-    Ok(timer)
+    Ok((timer, progress))
 }
 
-fn serve(stream: UnixStream, mut timer: Timer, config: &Config) -> io::Result<()> {
+fn serve(
+    stream: UnixStream,
+    mut timer: Timer,
+    config: &Config,
+    arena: &ArenaView,
+    progress: &Progress,
+) -> io::Result<()> {
     let mut reader = BufReader::new(&stream);
-    let mut cache = FilterCache::default();
+    let mut buffers = RequestBuffers::default();
+    let mut cache = HashMap::new();
     let cpu_time = Expiration::OneShot(TimeSpec::from_duration(config.cpu_time));
     // A zero expiration disarms the timer.
     let disarmed = Expiration::OneShot(TimeSpec::new(0, 0));
 
     loop {
-        let request = Request::read(&mut reader, config)?;
-        timer.set(cpu_time, TimerSetTimeFlags::empty())?;
-        let reply = handle(&mut cache, request);
-        timer.set(disarmed, TimerSetTimeFlags::empty())?;
+        if reader.buffer().is_empty() {
+            spin_for_request(&stream, config.spin);
+        }
+        let reply = match buffers.read(&mut reader, config)? {
+            Request::Check { id, source } => {
+                timer.set(cpu_time, TimerSetTimeFlags::empty())?;
+                let compiled = jq::compile(source);
+                timer.set(disarmed, TimerSetTimeFlags::empty())?;
+                match compiled {
+                    Ok(filter) => {
+                        if id != 0 {
+                            cache.insert(id, filter);
+                        }
+                        Reply::Valid
+                    }
+                    Err(message) => Reply::InvalidFilter(message),
+                }
+            }
+            Request::Evaluate {
+                input,
+                inline,
+                forget,
+                filters,
+            } => {
+                for id in forget {
+                    cache.remove(id);
+                }
+                let doc: Document = match input {
+                    // Safety: the service keeps the slot alive and unwritten until this request
+                    // is answered, and `doc` is dropped before that, which is checked below.
+                    InputAt::Arena { offset, len } => match unsafe { arena.input(offset, len) } {
+                        Some(input) => Rc::new(input),
+                        None => return Err(io::ErrorKind::InvalidData.into()),
+                    },
+                    InputAt::Inline { .. } => Rc::new(std::mem::take(inline)),
+                };
+
+                for (index, (id, source)) in filters.iter().enumerate() {
+                    progress.start(index);
+                    // Each filter gets the whole budget, compiling it included.
+                    timer.set(cpu_time, TimerSetTimeFlags::empty())?;
+                    let verdict = evaluate(&mut cache, *id, source, &doc);
+                    progress.set_verdict(index, verdict);
+                }
+                timer.set(disarmed, TimerSetTimeFlags::empty())?;
+
+                if Rc::strong_count(&doc) != 1 {
+                    exit(EXIT_INPUT_RETAINED);
+                }
+                Reply::Evaluated
+            }
+        };
         (&stream).write_all(&reply.encode())?;
     }
 }
 
-fn handle(cache: &mut FilterCache, request: Request) -> Reply {
-    let Request {
-        kind,
-        filter,
-        input,
-    } = request;
-    let result = cache.with(filter, |filter| match kind {
-        Kind::Check => Reply::Valid,
-        Kind::Evaluate => match serde_json::from_slice::<serde_json::Value>(&input) {
-            Ok(input) => Reply::Matched(jq::matches(filter, Val::from(input))),
-            Err(error) => Reply::InvalidInput(error.to_string()),
-        },
-    });
-    result.unwrap_or_else(Reply::InvalidFilter)
+/// Polls the socket for up to `spin` before the worker goes to sleep in a blocking read, see
+/// [`Config::spin`].
+fn spin_for_request(stream: &UnixStream, spin: Duration) {
+    if spin.is_zero() {
+        return;
+    }
+    let started = Instant::now();
+    let mut byte = [0];
+    while started.elapsed() < spin {
+        // Anything but "nothing to read yet" ends the wait: a request, the service closing the
+        // socket, or an error, which the blocking read then reports.
+        match recv(
+            stream.as_raw_fd(),
+            &mut byte,
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
+        ) {
+            Err(Errno::EAGAIN) => std::hint::spin_loop(),
+            _ => return,
+        }
+    }
 }
 
-/// Compiled filters this worker has seen, by source.
-///
-/// Compiling takes around a hundred times longer than running a typical filter, because every
-/// compilation processes jq's whole prelude, and the service evaluates the same few filters over
-/// and over.
-///
-/// The cache lives inside the worker's memory limit, so it has to stay small next to it. A
-/// compiled filter holds roughly 110 kB plus 140 bytes per byte of source; the two bounds below
-/// keep the cache under about 6 MB.
-#[derive(Default)]
-struct FilterCache {
-    filters: HashMap<String, jq::Filter>,
-    source_len: usize,
-}
-
-impl FilterCache {
-    const MAX_FILTERS: usize = 32;
-    /// Total source length of the cached filters. A single filter longer than this is compiled
-    /// for each evaluation.
-    const MAX_SOURCE_LEN: usize = 16 << 10;
-
-    /// Calls `f` with the compiled `code`, compiling it if needed. Fails with the compiler's
-    /// message if `code` is not a valid filter.
-    fn with<R>(&mut self, code: String, f: impl FnOnce(&jq::Filter) -> R) -> Result<R, String> {
-        if let Some(filter) = self.filters.get(&code) {
-            return Ok(f(filter));
+/// Runs one filter of a batch, compiling it first if it comes with its source.
+fn evaluate(cache: &mut HashMap<u64, jq::Filter>, id: u64, source: &str, doc: &Document) -> u8 {
+    if !source.is_empty() {
+        match jq::compile(source) {
+            Ok(filter) => {
+                cache.insert(id, filter);
+            }
+            Err(_) => return verdict::INVALID_FILTER,
         }
-
-        let filter = jq::compile(&code)?;
-        if code.len() > Self::MAX_SOURCE_LEN {
-            return Ok(f(&filter));
-        }
-        if self.filters.len() >= Self::MAX_FILTERS
-            || self.source_len + code.len() > Self::MAX_SOURCE_LEN
-        {
-            self.filters.clear();
-            self.source_len = 0;
-        }
-        self.source_len += code.len();
-        Ok(f(self.filters.entry(code).or_insert(filter)))
+    }
+    match cache.get(&id) {
+        Some(filter) if jq::matches(filter, Value::Doc(DocRef::root(doc.clone()))) => verdict::TRUE,
+        Some(_) => verdict::FALSE,
+        // The service only sends an id alone to a worker it sent the source to before.
+        None => verdict::INVALID_FILTER,
     }
 }

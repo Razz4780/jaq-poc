@@ -2,8 +2,8 @@
 //!
 //! They travel over a `SOCK_SEQPACKET` pair, so every message arrives whole and the peer going
 //! away reads as a zero-length message. Every message is [`MESSAGE_LEN`] bytes: a tag and an
-//! `i32`. The reply to [`Request::Spawn`] also carries the service's end of the new worker's
-//! socket as `SCM_RIGHTS` ancillary data.
+//! `i32`. The reply to [`Request::Spawn`] also carries, as `SCM_RIGHTS` ancillary data, the
+//! service's end of the new worker's socket and the worker's progress page.
 //!
 //! The service sends one request and waits for its reply before sending the next.
 
@@ -66,7 +66,8 @@ pub enum Reply {
     Ready,
     /// The dispatcher could not set itself up, or could not fork a worker.
     Failed(Errno),
-    /// A worker was forked. The service's end of its socket is attached.
+    /// A worker was forked. The service's end of its socket and its progress page are attached,
+    /// in that order.
     Spawned(Pid),
     /// The released worker exited with this code.
     Exited(i32),
@@ -101,16 +102,20 @@ impl Reply {
     }
 }
 
-/// Sends one message, with `attached` passed along as a file descriptor.
+/// Most descriptors one message carries.
+const MAX_ATTACHED: usize = 2;
+
+/// Sends one message, with `attached` passed along as file descriptors.
 pub fn send(
     socket: BorrowedFd<'_>,
     message: Message,
-    attached: Option<BorrowedFd<'_>>,
+    attached: &[BorrowedFd<'_>],
 ) -> io::Result<()> {
-    let attached = attached.map(|fd| [fd.as_raw_fd()]);
-    let control_messages = match &attached {
-        Some(fds) => vec![ControlMessage::ScmRights(fds)],
-        None => Vec::new(),
+    let attached: Vec<RawFd> = attached.iter().map(AsRawFd::as_raw_fd).collect();
+    let control_messages = if attached.is_empty() {
+        Vec::new()
+    } else {
+        vec![ControlMessage::ScmRights(&attached)]
     };
     // `MSG_NOSIGNAL`: a peer that is gone must surface as an error here, whatever the process
     // does with `SIGPIPE`.
@@ -128,12 +133,12 @@ pub fn send(
     }
 }
 
-/// Receives one message and the file descriptor attached to it, if any.
+/// Receives one message and the file descriptors attached to it.
 ///
 /// Fails with [`io::ErrorKind::UnexpectedEof`] when the peer has closed its end.
-pub fn receive(socket: BorrowedFd<'_>) -> io::Result<(Message, Option<OwnedFd>)> {
+pub fn receive(socket: BorrowedFd<'_>) -> io::Result<(Message, Vec<OwnedFd>)> {
     let mut message: Message = [0; MESSAGE_LEN];
-    let mut control_buffer = nix::cmsg_space!(RawFd);
+    let mut control_buffer = nix::cmsg_space!([RawFd; MAX_ATTACHED]);
     let (received, attached) = {
         let mut iov = [IoSliceMut::new(&mut message)];
         let received = recvmsg::<()>(
@@ -158,7 +163,7 @@ pub fn receive(socket: BorrowedFd<'_>) -> io::Result<(Message, Option<OwnedFd>)>
 
     match received {
         0 => Err(io::ErrorKind::UnexpectedEof.into()),
-        MESSAGE_LEN => Ok((message, attached.into_iter().next())),
+        MESSAGE_LEN => Ok((message, attached)),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }

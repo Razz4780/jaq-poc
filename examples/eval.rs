@@ -45,6 +45,8 @@ fn main() -> ExitCode {
         let sandbox = dispatcher
             .connect()
             .map_err(jq_sandbox::Error::Unavailable)?;
+        let filter = sandbox.compile(&filter).await?;
+        let input = sandbox.input(&input)?;
         sandbox.evaluate(&filter, &input).await
     });
 
