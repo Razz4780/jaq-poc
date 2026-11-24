@@ -3,9 +3,9 @@
 //! The service sends one request and reads its whole reply before sending the next. Lengths are
 //! little-endian `u32`s.
 //!
-//! - `CHECK`, then the length and text of a filter's source. The reply is [`VALID`], or
+//! - `CHECK` marker, then the length and text of a filter's source. The reply is [`VALID`], or
 //!   [`INVALID`] followed by the length and text of the compiler's message.
-//! - `EVALUATE`, then the length and JSON text of the input, the number of filters, and the
+//! - `EVALUATE` marker, then the length and JSON text of the input, the number of filters, and the
 //!   length and text of each filter's source. The reply is [`INPUT_OK`] or [`INPUT_INVALID`]
 //!   once the input is parsed, and after `INPUT_OK` one [`verdict`] per filter, each written as
 //!   soon as the filter is done. A worker that dies over a filter leaves every verdict before it
